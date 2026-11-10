@@ -65,14 +65,13 @@ expect(fake.creates === 1 && model && model.tokens === tokens, "sherpa-onnx crea
 expect(model && model.transducer.encoder === encoder && model.transducer.decoder === decoder && model.transducer.joiner === joiner, "recognizer config is built from the model directory");
 expect(fake.recognizerConfig.featConfig.sampleRate === 16000, "recognizer feature rate is 16 kHz");
 expect(fake.accepts.length === 1 && fake.accepts[0].sampleRate === 16000 && fake.accepts[0].length === 1600, "sherpa-onnx acceptWaveform 16000");
-expect(fake.vadConfig.sampleRate === 16000 && fake.vadConfig.sileroVad.windowSize === 512, "silero vad window is 512 at 16 kHz");
-expect(fake.vad.length === 1 && fake.vad[0] === 1600, "silero vad acceptWaveform");
+expect(fake.vad.length === 0, "no unused vad is created or fed");
 expect(session.fullTranscript.includes("适配器转写"), "sherpa-onnx result enters the transcript");
 expect(session.gemmaResident === false, "Gemma-not-resident-during-transcription");
 
 const wide = new Float32Array(4800);
 const widePush = session.pushPcm(wide, 48000);
-expect(widePush === 0 && fake.accepts[1].sampleRate === 16000 && fake.accepts[1].length === 1600, "pushPcm resamples to 16 kHz before sherpa-onnx");
+expect(widePush === 0 && fake.accepts[1].sampleRate === 16000 && fake.accepts[1].length <= 1600 && fake.accepts[1].length >= 1584, "pushPcm resamples to 16 kHz before sherpa-onnx");
 
 const result = await session.summarizeWithGemma(gemma);
 expect(fake.models.length === 1 && fake.models[0] === gemma, "summarize loads the web .litertlm");
@@ -91,10 +90,11 @@ const absent = createSession({
   webSummary: true,
 });
 await absent.loadRecognizer({ tokens: join(dir, "no-asr-model", "tokens.txt") });
-absent.pushPcm(new Float32Array(1600), 16000);
-expect(absent.displayText.includes("你好，这是已经成稿的一句。"), "canned text only when the model file is absent");
-const canned = await absent.summarizeWithGemma(missing);
-expect(canned.summary.includes("网页版 Gemma"), "missing web model returns canned summary");
+expect(absent.pushPcm(new Float32Array(1600), 16000) === -3 && absent.displayText === "", "missing asr model returns -3 and paints nothing");
+expect(absent.lastError.includes("missing"), "missing asr model says why");
+absent.pushAsrEvent({ isFinal: 1, text: "今天开会", startMs: 0, endMs: 800 });
+const noModel = await absent.summarizeWithGemma(missing);
+expect(noModel.summary === -3 && absent.lastError.includes("not found"), "missing summary model returns -3, not a made-up summary");
 expect(fake.models.length === modelsBefore, "missing web model does not call Engine.create");
 expect(fake.deleted === deletedBefore, "missing web model does not unload an engine it did not load");
 
@@ -109,6 +109,17 @@ fromDownload.pushAsrEvent({ isFinal: 1, text: "今天开会", startMs: 0, endMs:
 const downloaded = await fromDownload.summarizeWithGemma(missing);
 expect(fake.models.at(-1) === weights, "a downloaded Gemma 4 E2B file is what the summarizer loads");
 expect(typeof downloaded.summary === "string" && !downloaded.summary.includes("网页版 Gemma"), "a downloaded model is summarized instead of the missing-file note");
+
+const overridden = createSession({
+  summaryModelPath: missing,
+  asrModelPath: join(dir, "no-asr-model"),
+  webSummary: true,
+});
+overridden.pushAsrEvent({ isFinal: 1, text: "今天开会", startMs: 0, endMs: 800 });
+const withOverride = await overridden.summarizeWithGemma(gemma);
+expect(fake.models.at(-1) === gemma, "a model passed to summarizeWithGemma is the one that gets loaded");
+expect(typeof withOverride.summary === "string" && withOverride.summary.includes("适配器摘要"),
+       "a model passed to summarizeWithGemma replaces a missing configured path");
 
 fake.throwOnCreate = true;
 const broken = createSession({

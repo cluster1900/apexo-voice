@@ -33,12 +33,18 @@ const chunk = 128;
 const input = new Float32Array(total);
 for (let i = 0; i < total; i += 1) input[i] = Math.sin((2 * Math.PI * 440 * i) / rate);
 const once = resampleTo16k(input, rate);
-const whole = createStreamingResampler()(input, rate);
+const wholeStream = createStreamingResampler();
+const wholeHead = wholeStream(input, rate);
+const wholeTail = wholeStream.flush();
+const whole = new Float32Array(wholeHead.length + wholeTail.length);
+whole.set(wholeHead, 0);
+whole.set(wholeTail, wholeHead.length);
 const parts = [];
 const chunked = createStreamingResampler();
 for (let offset = 0; offset < total; offset += chunk) {
   parts.push(chunked(input.subarray(offset, Math.min(total, offset + chunk)), rate));
 }
+parts.push(chunked.flush());
 let count = 0;
 for (const part of parts) count += part.length;
 const merged = new Float32Array(count);
@@ -71,7 +77,27 @@ for (let offset = 0; offset < total; offset += chunk) {
 }
 let fed = 0;
 for (const pcm of seen) fed += pcm.length;
-expect(fed === once.length, "pushPcm feeds the recognizer the whole resampled voice");
+expect(fed <= once.length && fed >= once.length - 16, "pushPcm feeds the recognizer the whole resampled voice (all but the last half millisecond)");
+
+// Down-sampling must not fold audio above 8 kHz into the speech band, and must keep the speech band.
+function rms(samples) {
+  let sum = 0;
+  for (const v of samples) sum += v * v;
+  return Math.sqrt(sum / samples.length);
+}
+function tone(freq, seconds) {
+  const out = new Float32Array(rate * seconds);
+  for (let i = 0; i < out.length; i += 1) out[i] = Math.sin((2 * Math.PI * freq * i) / rate);
+  return out;
+}
+const inBand = resampleTo16k(tone(1000, 1), rate);
+const aboveNyquist = resampleTo16k(tone(12000, 1), rate); // a naive resampler folds this down to 4 kHz
+const inBandLevel = rms(inBand.subarray(400, inBand.length - 400));
+const aliasLevel = rms(aboveNyquist.subarray(400, aboveNyquist.length - 400));
+expect(Math.abs(inBandLevel - Math.SQRT1_2) < 0.01, "a 1 kHz tone keeps its level after down-sampling");
+expect(aliasLevel < 0.02, "a 12 kHz tone does not alias into the 16 kHz output");
+const odd = resampleTo16k(Float32Array.from({ length: 44100 }, (_, i) => Math.sin((2 * Math.PI * 1000 * i) / 44100)), 44100);
+expect(Math.abs(odd.length - 16000) <= 1, "a non-integer ratio (44.1 kHz) gives the right number of samples");
 
 if (failures !== 0) {
   console.log(`${failures} failure(s)`);

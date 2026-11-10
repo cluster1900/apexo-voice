@@ -7,8 +7,8 @@
 extern "C" {
 #endif
 
-ApexoSession* DemoCreateSession(const char* model_path);
-void DemoDestroyEngines(void);
+ApexoSession* DemoCreateSession(const char* asr_model_dir, const char* model_path, void** engines_out);
+void DemoDestroyEngines(void* engines);
 
 #ifdef __cplusplus
 }

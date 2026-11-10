@@ -76,6 +76,7 @@ void litert_lm_json_response_delete(void* response) { (void)response; }
 
 int litert_lm_json_response_get_string(const void* response, const char** out_json) {
   (void)response;
-  if (out_json != 0) *out_json = g_json;
+  const char* override_json = getenv("APEXO_FAKE_JSON");
+  if (out_json != 0) *out_json = (override_json != 0 && override_json[0] != '\0') ? override_json : g_json;
   return 0;
 }

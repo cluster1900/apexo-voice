@@ -48,7 +48,9 @@ typedef struct ApexoConfig {
   int32_t summary_chunk_chars;
   int32_t display_lines;
   const char* summary_model_path;
-  int32_t web_summary; /* 1: require a web Gemma file; 0: reject a web Gemma file */
+  int32_t web_summary; /* 1: the model is supplied by a browser runtime, so a model name is required (a path
+                        * that is only a label is fine). 0: native; an empty path is reported by summarize as -3.
+                        * Either way a non-empty path must end in .litertlm. */
 } ApexoConfig;
 
 APEXO_API ApexoSession* apexo_session_create(const ApexoConfig* config, const ApexoEngines* engines);
@@ -58,14 +60,33 @@ APEXO_API int apexo_session_end_segment(ApexoSession* session);
 APEXO_API int apexo_session_gemma_resident(const ApexoSession* session);
 APEXO_API const char* apexo_session_display_text(const ApexoSession* session);
 APEXO_API const char* apexo_session_full_transcript(const ApexoSession* session);
+APEXO_API const char* apexo_session_summary_text(const ApexoSession* session);
 APEXO_API int apexo_session_summarize(ApexoSession* session, char* out, int32_t out_cap);
+/* Summarizes the transcript added since the last summary and appends to summary_text. A line still being
+ * recognized is closed first (as end_segment does) and included. Does not stop or block live push_pcm calls while
+ * running. */
+APEXO_API int apexo_session_summarize_new(ApexoSession* session, char* out, int32_t out_cap);
 APEXO_API void apexo_session_release(ApexoSession* session);
 APEXO_API const char* apexo_session_last_error(const ApexoSession* session);
 
-/* Default engines dlopen sherpa-onnx and LiteRT-LM. A missing model file may
- * emit canned text. A present model file is never replaced with canned text. */
+/* Default engines dlopen sherpa-onnx and LiteRT-LM (LiteRT-LM C API 1.0.0 or newer).
+ *
+ * asr_model_dir must hold encoder.onnx, decoder.onnx, joiner.onnx and tokens.txt. If any file is missing,
+ * push_pcm returns -3 and the transcript stays empty. Nothing is invented. A missing summary model file makes
+ * summarize return -3 as well.
+ *
+ * Threading: one session may be used from several threads (for example capture on one, summarize on another).
+ * push_pcm is refused with -5 while Gemma is resident, and only one summarize runs at a time. summarize blocks
+ * its caller while the model runs, so do not call it on a UI thread. Strings returned by display_text,
+ * full_transcript and last_error stay valid until the next call that changes the session. */
 APEXO_API void* apexo_engine_state_create(const char* asr_model_dir, const char* gemma_path);
 APEXO_API void apexo_engine_state_destroy(void* state);
+/* Where to dlopen the engines from, instead of the default names or APEXO_SHERPA_LIBRARY and
+ * APEXO_LITERT_LIBRARY. Call it right after apexo_engine_state_create, before the first push_pcm or summarize.
+ * Pass NULL or "" to keep the default for one of them. On iOS pass the path of the embedded, signed framework
+ * binary (for example <app>/Frameworks/sherpa-onnx.framework/sherpa-onnx). Ignored when the library was built with
+ * -DAPEXO_STATIC_ENGINES, which links the engines into the host program instead. */
+APEXO_API void apexo_engine_state_set_libraries(void* state, const char* sherpa_library, const char* litert_library);
 APEXO_API int apexo_engine_state_bind(void* state, ApexoEngines* out);
 
 #ifdef __cplusplus

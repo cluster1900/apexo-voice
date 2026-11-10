@@ -112,8 +112,9 @@ try {
   } catch (error) {
     absentError = error;
   }
-  absent.pushPcm(new Float32Array(1600), 16000);
-  expect(absentError == null && absent.displayText.includes(CANNED), "missing tokens.txt paints canned text");
+  const absentPush = absent.pushPcm(new Float32Array(1600), 16000);
+  expect(absentError == null && absentPush === -3 && absent.displayText === "", "missing tokens.txt returns -3 and paints nothing");
+  expect(absent.recognizerState === "missing", "missing tokens.txt leaves the recognizer in the missing state");
 } finally {
   stopServer();
   let entries = [];

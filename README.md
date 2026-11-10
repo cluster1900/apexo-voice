@@ -25,7 +25,7 @@ Apexo 是本地实时转写和文字总结。麦克风或宿主送来的 PCM 进
 
 Android AAR、iOS xcframework、macOS dylib、Windows x64 DLL，加网页 npm 包。调用方式同一套。录音、权限和界面由宿主负责。见 [docs/平台包.md](docs/平台包.md)。
 
-原生总结用 Gemma 4 E2B 的 `.litertlm`，文件名不要带 `-web`。网页总结用带 WebGPU 产物的文件。演示页上的「下载 Gemma 4 E2B」拉取的是 `gemma-4-E2B-it-gpu.litertlm`。
+原生总结用 Gemma 4 E2B 的 CPU 版 `.litertlm`。网页总结用带 WebGPU 产物的文件。SDK 不从文件名猜版本，选哪一份由宿主负责。演示页上的「下载 Gemma 4 E2B」拉取的是 `gemma-4-E2B-it-gpu.litertlm`。
 
 ## 网页演示
 
@@ -50,6 +50,9 @@ node ./test/session.test.js
 node ./test/capture.test.js
 node ./test/asr-presence.test.js
 node ./test/demo-flow.test.js
+node ./test/asr-pipeline.test.js
 ```
 
 `demo-flow.test.js` 使用开发依赖里的 Playwright。第一次跑之前执行 `npx playwright install chromium`。原生库测试要先有 `dist/macos/libapexo_session.dylib`，再跑仓库根目录的 `./run-tests.sh`。
+
+用真实模型和真实音频验证（可选，模型不在仓库里）：设置 `APEXO_TEST_ASR_DIR`（四个模型文件加 `test_wavs/0.wav`）后，`web/test/browser-asr.test.js` 在 Chromium 里跑 worker 识别；再设置 `APEXO_SHERPA_LIBRARY`（sherpa-onnx 的 C 动态库）后，`./run-tests.sh` 会让原生适配器也对着真库跑一遍。

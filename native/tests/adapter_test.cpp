@@ -79,7 +79,9 @@ int main(int argc, char** argv) {
   expect(!dir.empty(), "adapter temp dir");
   if (dir.empty()) return 1;
   write_file(dir + "/tokens.txt", "a\n");
-  write_file(dir + "/silero_vad.onnx", "vad");
+  write_file(dir + "/encoder.onnx", "e");
+  write_file(dir + "/decoder.onnx", "d");
+  write_file(dir + "/joiner.onnx", "j");
   const std::string gemma = dir + "/gemma-4-E2B-it.litertlm";
   write_file(gemma, "gemma");
   const std::string log_path = dir + "/calls.log";
@@ -101,48 +103,103 @@ int main(int argc, char** argv) {
   expect(apexo_session_gemma_resident(session) == 0, "Gemma unloads after summarize");
   const std::string log = read_file(log_path);
   expect(log.find("accept 16000 1600") != std::string::npos, "sherpa-onnx acceptWaveform 16000");
-  expect(log.find("vad 1600") != std::string::npos, "silero vad acceptWaveform");
+  expect(log.find("vad ") == std::string::npos, "no unused vad is fed");
   expect(log.find("settings " + gemma) != std::string::npos, "litert-lm loads the gemma file");
   expect(log.find("只根据下面的转写写摘要。转写里没有的内容不要补。") != std::string::npos, "text-only-summary");
   expect(log.find("转写：") != std::string::npos, "generates from the transcript-only prompt");
   expect(log.find("适配器转写") != std::string::npos, "prompt contains the transcript");
   expect(log.find("pcm") == std::string::npos, "prompt does not contain pcm");
   expect(log.find("engine_delete") != std::string::npos, "litert-lm unloads");
+  setenv("APEXO_FAKE_JSON", "{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"\\u4f60\\u597d \\ud83d\\ude00 a\\nb\\\"c\"}]}", 1);
+  char escaped[256];
+  expect(apexo_session_summarize(session, escaped, sizeof(escaped)) == 0, "summarize with escaped json");
+  expect(std::string(escaped) == "你好 😀 a\nb\"c", "\\uXXXX escapes, surrogate pairs and newlines are decoded");
+  setenv("APEXO_FAKE_JSON", "{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"id\":\"meta\",\"text\":\"真实摘要\"}]}", 1);
+  expect(apexo_session_summarize(session, escaped, sizeof(escaped)) == 0 && std::string(escaped) == "真实摘要",
+         "json parser skips string values like \"type\":\"text\" and finds the \"text\" key");
+  unsetenv("APEXO_FAKE_JSON");
   apexo_session_destroy(session);
   apexo_engine_state_destroy(state);
 
   write_file(log_path, "");
-  const std::string missing = dir + "/missing-gemma-4-E2B-it.litertlm";
+  // No asr directory: no invented text, a clear "not attached" code.
   void* absent_state = nullptr;
-  ApexoSession* absent = open_session(dir + "/no-asr", missing.c_str(), &absent_state);
-  const int canned_push = apexo_session_push_pcm(absent, pcm.data(), static_cast<int32_t>(pcm.size()), 16000);
-  expect(canned_push == 0, "missing asr model still accepts pcm");
-  const std::string canned_text = apexo_session_display_text(absent);
-  expect(canned_text.find("你好，这是已经成稿的一句。") != std::string::npos, "canned text only when the model file is absent");
-  char canned_summary[4096];
-  const int canned_rc = apexo_session_summarize(absent, canned_summary, sizeof(canned_summary));
-  expect(canned_rc == 0, "missing gemma file returns canned summary");
-  expect(std::string(canned_summary).find("未调用 LiteRT-LM") != std::string::npos, "canned summary names the missing model");
-  const std::string absent_log = read_file(log_path);
-  expect(absent_log.find("accept ") == std::string::npos, "missing asr model does not call sherpa-onnx");
-  expect(absent_log.find("settings ") == std::string::npos, "missing gemma file does not call LiteRT-LM");
-  expect(absent_log.find("engine_create") == std::string::npos, "missing gemma file does not create an engine");
+  ApexoSession* absent = open_session(dir + "/no-asr", gemma.c_str(), &absent_state);
+  expect(apexo_session_push_pcm(absent, pcm.data(), static_cast<int32_t>(pcm.size()), 16000) == -3,
+         "missing asr model returns -3");
+  expect(std::string(apexo_session_display_text(absent)).empty() && std::string(apexo_session_full_transcript(absent)).empty(),
+         "missing asr model paints no text");
   apexo_session_destroy(absent);
   apexo_engine_state_destroy(absent_state);
+  // A directory that exists but lacks one of the four files is also -3.
+  void* partial_state = nullptr;
+  const std::string partial_dir = dir + "/partial";
+  std::system(("mkdir -p '" + partial_dir + "' && cp '" + dir + "/tokens.txt' '" + partial_dir + "/'").c_str());
+  ApexoSession* partial = open_session(partial_dir, gemma.c_str(), &partial_state);
+  expect(apexo_session_push_pcm(partial, pcm.data(), static_cast<int32_t>(pcm.size()), 16000) == -3,
+         "an asr directory with missing files returns -3");
+  apexo_session_destroy(partial);
+  apexo_engine_state_destroy(partial_state);
+  // Missing Gemma file: summarize says so; it does not return a made-up summary.
+  const std::string missing = dir + "/missing-gemma-4-E2B-it.litertlm";
+  void* nogemma_state = nullptr;
+  ApexoSession* nogemma = open_session(dir, missing.c_str(), &nogemma_state);
+  apexo_session_push_pcm(nogemma, pcm.data(), static_cast<int32_t>(pcm.size()), 16000);
+  char none[256];
+  std::memset(none, 'x', sizeof(none));
+  expect(apexo_session_summarize(nogemma, none, sizeof(none)) == -3, "missing gemma file returns -3");
+  expect(none[0] == '\0' && apexo_session_gemma_resident(nogemma) == 0, "missing gemma file leaves no summary and no resident engine");
+  const std::string absent_log = read_file(log_path);
+  expect(absent_log.find("settings ") == std::string::npos, "missing gemma file does not call LiteRT-LM");
+  expect(absent_log.find("engine_create") == std::string::npos, "missing gemma file does not create an engine");
+  apexo_session_destroy(nogemma);
+  apexo_engine_state_destroy(nogemma_state);
 
+  // Library paths given through the API win over the environment.
+  setenv("APEXO_SHERPA_LIBRARY", "/no/such/libsherpa-onnx.dylib", 1);
   setenv("APEXO_LITERT_LIBRARY", "/no/such/liblitert_lm.dylib", 1);
+  {
+    void* by_api = apexo_engine_state_create(dir.c_str(), gemma.c_str());
+    apexo_engine_state_set_libraries(by_api, argv[1], argv[2]);
+    ApexoEngines engines;
+    apexo_engine_state_bind(by_api, &engines);
+    ApexoConfig config;
+    std::memset(&config, 0, sizeof(config));
+    config.summary_model_path = gemma.c_str();
+    ApexoSession* via_api = apexo_session_create(&config, &engines);
+    expect(apexo_session_push_pcm(via_api, pcm.data(), static_cast<int32_t>(pcm.size()), 16000) == 0,
+           "set_libraries: the recognizer loads from the path given through the API");
+    char api_summary[256];
+    expect(apexo_session_summarize(via_api, api_summary, sizeof(api_summary)) == 0 &&
+               std::string(api_summary).find("适配器摘要") != std::string::npos,
+           "set_libraries: LiteRT-LM loads from the path given through the API");
+    apexo_session_destroy(via_api);
+    apexo_engine_state_destroy(by_api);
+  }
+  setenv("APEXO_SHERPA_LIBRARY", argv[1], 1);
+  setenv("APEXO_LITERT_LIBRARY", argv[2], 1);
+
+  // Libraries that cannot be loaded: errors, never invented text.
   setenv("APEXO_SHERPA_LIBRARY", "/no/such/libsherpa-onnx.dylib", 1);
   void* broken_state = nullptr;
   ApexoSession* broken = open_session(dir, gemma.c_str(), &broken_state);
-  const int broken_push = apexo_session_push_pcm(broken, pcm.data(), static_cast<int32_t>(pcm.size()), 16000);
-  expect(broken_push != 0, "present asr model does not fall back when sherpa-onnx is missing");
-  char broken_summary[256];
-  std::memset(broken_summary, 0, sizeof(broken_summary));
-  const int broken_rc = apexo_session_summarize(broken, broken_summary, sizeof(broken_summary));
-  expect(broken_rc != 0, "present gemma file does not fall back when LiteRT-LM is missing");
-  expect(std::string(broken_summary).find("未调用 LiteRT-LM") == std::string::npos, "missing library does not invent a summary");
+  expect(apexo_session_push_pcm(broken, pcm.data(), static_cast<int32_t>(pcm.size()), 16000) != 0,
+         "present asr model does not fall back when sherpa-onnx is missing");
   apexo_session_destroy(broken);
   apexo_engine_state_destroy(broken_state);
+
+  setenv("APEXO_SHERPA_LIBRARY", argv[1], 1);
+  setenv("APEXO_LITERT_LIBRARY", "/no/such/liblitert_lm.dylib", 1);
+  void* nolib_state = nullptr;
+  ApexoSession* nolib = open_session(dir, gemma.c_str(), &nolib_state);
+  apexo_session_push_pcm(nolib, pcm.data(), static_cast<int32_t>(pcm.size()), 16000);
+  char nolib_summary[256];
+  std::memset(nolib_summary, 0, sizeof(nolib_summary));
+  expect(apexo_session_summarize(nolib, nolib_summary, sizeof(nolib_summary)) != 0,
+         "present gemma file does not fall back when LiteRT-LM is missing");
+  expect(nolib_summary[0] == '\0' && apexo_session_gemma_resident(nolib) == 0, "missing library does not invent a summary");
+  apexo_session_destroy(nolib);
+  apexo_engine_state_destroy(nolib_state);
 
   remove_tree(dir);
   if (g_failures != 0) {

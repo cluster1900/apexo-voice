@@ -3,7 +3,13 @@ set -eu
 ROOT="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
 DIST="$ROOT/dist"
 ZIG="${ZIG:-zig}"
-JAVA_HOME="${JAVA_HOME:-/Users/hawk_wu/Library/Java/JavaVirtualMachines/openjdk-24.0.1/Contents/Home}"
+if [ -z "${JAVA_HOME:-}" ]; then
+  JAVA_HOME="$(/usr/libexec/java_home 2>/dev/null || true)"
+fi
+if [ -z "$JAVA_HOME" ] || [ ! -d "$JAVA_HOME/include" ]; then
+  echo "JAVA_HOME must point to a JDK (it is needed for jni.h and javac)." >&2
+  exit 1
+fi
 rm -rf "$DIST"
 mkdir -p "$DIST/macos" "$DIST/ios" "$DIST/android" "$DIST/windows" "$DIST/web" "$DIST/obj"
 

@@ -15,11 +15,20 @@ struct ContentView: View {
             HStack {
                 Button(running ? "录音中" : "开始麦克风") {
                     mic.onText = { transcript = $0 }
-                    try? mic.start()
-                    running = true
+                    do {
+                        try mic.start()
+                        running = true
+                    } catch {
+                        running = false
+                        transcript = "麦克风没有打开：\(error.localizedDescription)"
+                    }
                 }
                 Button("结束一段") { mic.endSegment() }
-                Button("总结") { transcript = mic.summarize() }
+                Button("总结") {
+                    running = false
+                    transcript = "正在总结"
+                    mic.summarize { transcript = $0 }
+                }
                     .accessibilityIdentifier("summarize")
             }
         }

@@ -65,7 +65,17 @@ const server = createServer(async (request, response) => {
     return;
   }
   let file = join(root, "index.html");
-  if (url.pathname.startsWith("/vendor/")) file = inside(vendorRoot, decodeURIComponent(url.pathname.slice("/vendor/".length)));
+  if (url.pathname.startsWith("/vendor/")) {
+    let vendorPath;
+    try {
+      vendorPath = decodeURIComponent(url.pathname.slice("/vendor/".length));
+    } catch {
+      response.writeHead(400, sharedHeaders);
+      response.end("bad request");
+      return;
+    }
+    file = inside(vendorRoot, vendorPath);
+  }
   else if (url.pathname.startsWith("/sdk/")) file = inside(sdkRoot, url.pathname.slice("/sdk/".length));
   else if (url.pathname === "/worklet.js") file = join(root, "worklet.js");
   else if (url.pathname !== "/") file = inside(root, url.pathname.slice(1));

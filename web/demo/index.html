@@ -33,6 +33,7 @@
     <span id="gemma-file">gemma-4-E2B-it-gpu.litertlm</span>
   </p>
   <p id="gemma-progress">总结要用这份网页版权重，大约 2 GB。</p>
+  <p id="engine"></p>
   <p id="status"></p>
   <script type="module">
     import { createSession } from "/sdk/index.js";
@@ -43,9 +44,10 @@
     const downloadButton = document.querySelector("#download");
     const gemmaWebFile = "gemma-4-E2B-it-gpu.litertlm";
     const session = createSession({
-      summaryModelPath: "gemma-4-E2B-it-web.litertlm",
+      summaryModelPath: gemmaWebFile,
       asrModelPath: "asr-model",
       webSummary: true,
+      onChange: () => paint(), // events from the recognizer worker arrive after pushPcm has returned
     });
 
     try {
@@ -53,6 +55,9 @@
     } catch {
       // A present model that fails to load stays failed. Recording still keeps this segment.
     }
+    document.querySelector("#engine").textContent = session.recognizerState === "live"
+      ? "转写引擎：本机 sherpa-onnx，音频不离开浏览器。"
+      : "转写引擎：浏览器自带识别，Chrome 可能把音频发到云端。把四个语音模型文件放进 asr-model 目录后会改用本机识别。";
 
     let audioContext;
     let workletModule = false;
@@ -225,6 +230,9 @@
     document.querySelector("#mic").addEventListener("click", () => {
       startRecording().catch(() => {
         recording = false;
+        // Do not leave the microphone open when a later step (audio context, worklet) failed.
+        if (media) media.getTracks().forEach((track) => track.stop());
+        media = null;
         status.textContent = "麦克风没有打开";
       });
     });
@@ -254,6 +262,7 @@
 
     document.querySelector("#summarize").addEventListener("click", async () => {
       if (recording) finishRecording();
+      await session.drain();
       const spoken = session.fullTranscript;
       if (!spoken) {
         status.textContent = "还没有可总结的文字";
@@ -261,14 +270,18 @@
       }
       status.textContent = "正在总结";
       try {
-        const result = await session.summarizeWithGemma("gemma-4-E2B-it-web.litertlm");
-        const summary = typeof result.summary === "string" ? result.summary : session.lastError;
-        if (!summary || summary.includes("网页版 Gemma")) {
+        const result = await session.summarizeWithGemma(gemmaWebFile);
+        if (result.summary === -3) {
           transcript.textContent = spoken;
           status.textContent = "这一段的文字在上面。网页版 Gemma 权重不在，还不能另写总结。";
           return;
         }
-        transcript.textContent = `${spoken}\n\n总结\n${summary}`;
+        if (typeof result.summary !== "string") {
+          transcript.textContent = spoken;
+          status.textContent = `总结没有跑起来：${session.lastError}`;
+          return;
+        }
+        transcript.textContent = `${spoken}\n\n总结\n${result.summary}`;
         status.textContent = session.gemmaResident ? "Gemma 仍驻留" : "总结完成";
       } catch {
         status.textContent = "总结没有跑起来";
@@ -297,7 +310,7 @@
           gemmaProgress.textContent = `正在下载 Gemma 4 E2B ${amount}`;
         }
         if (total && received !== total) throw new Error("short download");
-        session.setSummaryModel(new Blob(chunks, { type: "application/octet-stream" }));
+        session.setSummaryModel(chunks);
         downloadButton.textContent = "Gemma 4 E2B 已下载";
         gemmaProgress.textContent = "Gemma 4 E2B 已下载，可以点总结。";
       } catch {
