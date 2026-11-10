@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>Apexo</title>
+  <style>
+    body { font-family: sans-serif; margin: 2rem; max-width: 40rem; }
+    #transcript { min-height: 8rem; white-space: pre-wrap; border: 1px solid #ccc; padding: 1rem; }
+    button { margin-right: 0.5rem; margin-bottom: 0.5rem; }
+    #download { font-size: 1rem; padding: 0.45rem 0.8rem; }
+    #gemma-file { font-family: ui-monospace, monospace; }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "@litert-lm/core": "/vendor/@litert-lm/core/dist/index.js",
+        "@litertjs/wasm-utils": "/vendor/@litertjs/wasm-utils/dist/index.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <h1>实时转写</h1>
+  <div id="transcript" aria-label="transcript"></div>
+  <p>
+    <button id="mic" type="button">开始录音</button>
+    <button id="stop" type="button">结束</button>
+    <button id="summarize" type="button">总结</button>
+    <button id="listen" type="button">回听刚才这一段</button>
+  </p>
+  <p id="gemma-offer">
+    <button id="download" type="button">下载 Gemma 4 E2B</button>
+    <span id="gemma-file">gemma-4-E2B-it-gpu.litertlm</span>
+  </p>
+  <p id="gemma-progress">总结要用这份网页版权重，大约 2 GB。</p>
+  <p id="status"></p>
+  <script type="module">
+    import { createSession } from "/sdk/index.js";
+
+    const transcript = document.querySelector("#transcript");
+    const status = document.querySelector("#status");
+    const gemmaProgress = document.querySelector("#gemma-progress");
+    const downloadButton = document.querySelector("#download");
+    const gemmaWebFile = "gemma-4-E2B-it-gpu.litertlm";
+    const session = createSession({
+      summaryModelPath: "gemma-4-E2B-it-web.litertlm",
+      asrModelPath: "asr-model",
+      webSummary: true,
+    });
+
+    try {
+      await session.loadRecognizer();
+    } catch {
+      // A present model that fails to load stays failed. Recording still keeps this segment.
+    }
+
+    let audioContext;
+    let workletModule = false;
+    let media;
+    let source;
+    let worklet;
+    let mute;
+    let recognition;
+    let recording = false;
+    let segmentSamples = [];
+    let lastSegment = new Float32Array(0);
+    let lastRate = 16000;
+    let segmentStarted = 0;
+    let committed = "";
+    let recognitionBlocked = false;
+
+    function paint() {
+      transcript.textContent = session.displayText;
+    }
+
+    function clock() {
+      return Math.max(0, Date.now() - segmentStarted);
+    }
+
+    function concat(chunks) {
+      let total = 0;
+      for (const chunk of chunks) total += chunk.length;
+      const out = new Float32Array(total);
+      let offset = 0;
+      for (const chunk of chunks) {
+        out.set(chunk, offset);
+        offset += chunk.length;
+      }
+      return out;
+    }
+
+    function segmentAudio() {
+      return recording ? concat(segmentSamples) : lastSegment;
+    }
+
+    function stopRecognition() {
+      const current = recognition;
+      recognition = null;
+      if (!current) return;
+      current.onresult = null;
+      current.onend = null;
+      current.onerror = null;
+      try {
+        current.stop();
+      } catch {
+        // Already stopped.
+      }
+    }
+
+    function startRecognition() {
+      const Speech = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (!Speech || session.recognizerState === "live") return;
+      recognitionBlocked = false;
+      committed = "";
+      const next = new Speech();
+      recognition = next;
+      next.lang = "zh-CN";
+      next.continuous = true;
+      next.interimResults = true;
+      next.onresult = (event) => {
+        if (!recording || recognition !== next) return;
+        let finals = "";
+        let interim = "";
+        for (let i = 0; i < event.results.length; i += 1) {
+          const text = event.results[i][0].transcript;
+          if (event.results[i].isFinal) finals += text;
+          else interim += text;
+        }
+        const now = clock();
+        if (finals && finals !== committed) {
+          const extra = finals.startsWith(committed) ? finals.slice(committed.length).trim() : finals.trim();
+          committed = finals;
+          if (extra) session.pushAsrEvent({ isFinal: 1, text: extra, startMs: now, endMs: now });
+        }
+        session.pushAsrEvent({ isFinal: 0, text: interim.trim(), startMs: now, endMs: now });
+        paint();
+      };
+      next.onerror = (event) => {
+        if (event.error === "not-allowed" || event.error === "service-not-allowed" || event.error === "network") {
+          recognitionBlocked = true;
+          status.textContent = "浏览器没能把声音转成文字";
+        }
+      };
+      next.onend = () => {
+        if (!recording || recognitionBlocked || recognition !== next) return;
+        committed = "";
+        try {
+          next.start();
+        } catch {
+          // A second start can overlap the first. The next onend retries.
+        }
+      };
+      next.start();
+    }
+
+    async function startRecording() {
+      if (recording) return;
+      session.release();
+      paint();
+      media = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: { ideal: 1 },
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        },
+      });
+      if (!audioContext || audioContext.state === "closed") {
+        try {
+          audioContext = new AudioContext({ sampleRate: 16000 });
+        } catch {
+          audioContext = new AudioContext();
+        }
+      }
+      if (audioContext.state === "suspended") await audioContext.resume();
+      if (!workletModule) {
+        await audioContext.audioWorklet.addModule("/worklet.js");
+        workletModule = true;
+      }
+      source = audioContext.createMediaStreamSource(media);
+      worklet = new AudioWorkletNode(audioContext, "apexo-capture");
+      mute = audioContext.createGain();
+      mute.gain.value = 0;
+      segmentSamples = [];
+      segmentStarted = Date.now();
+      lastRate = audioContext.sampleRate;
+      recording = true;
+      worklet.port.onmessage = (event) => {
+        if (!recording) return;
+        const samples = event.data instanceof Float32Array ? event.data : new Float32Array(event.data);
+        segmentSamples.push(new Float32Array(samples));
+        if (session.recognizerState === "live") {
+          session.pushPcm(samples, audioContext.sampleRate);
+          paint();
+        }
+      };
+      source.connect(worklet);
+      worklet.connect(mute);
+      mute.connect(audioContext.destination);
+      startRecognition();
+      status.textContent = "录音中";
+    }
+
+    function finishRecording() {
+      const wasRecording = recording;
+      recording = false;
+      stopRecognition();
+      if (media) media.getTracks().forEach((track) => track.stop());
+      media = null;
+      if (source) source.disconnect();
+      if (worklet) worklet.disconnect();
+      if (mute) mute.disconnect();
+      source = null;
+      worklet = null;
+      mute = null;
+      if (wasRecording) {
+        lastSegment = concat(segmentSamples);
+        segmentSamples = [];
+      }
+      session.endSegment();
+      paint();
+      status.textContent = "这一段已结束";
+    }
+
+    document.querySelector("#mic").addEventListener("click", () => {
+      startRecording().catch(() => {
+        recording = false;
+        status.textContent = "麦克风没有打开";
+      });
+    });
+
+    document.querySelector("#stop").addEventListener("click", () => {
+      if (!recording && !lastSegment.length) {
+        status.textContent = "还没有开始录音";
+        return;
+      }
+      finishRecording();
+    });
+
+    document.querySelector("#listen").addEventListener("click", () => {
+      const samples = segmentAudio();
+      if (!audioContext || !samples.length) {
+        status.textContent = "还没有可回听的一段";
+        return;
+      }
+      const buffer = audioContext.createBuffer(1, samples.length, lastRate);
+      buffer.copyToChannel(new Float32Array(samples), 0);
+      const player = audioContext.createBufferSource();
+      player.buffer = buffer;
+      player.connect(audioContext.destination);
+      player.start();
+      status.textContent = "正在回放刚才这一段";
+    });
+
+    document.querySelector("#summarize").addEventListener("click", async () => {
+      if (recording) finishRecording();
+      const spoken = session.fullTranscript;
+      if (!spoken) {
+        status.textContent = "还没有可总结的文字";
+        return;
+      }
+      status.textContent = "正在总结";
+      try {
+        const result = await session.summarizeWithGemma("gemma-4-E2B-it-web.litertlm");
+        const summary = typeof result.summary === "string" ? result.summary : session.lastError;
+        if (!summary || summary.includes("网页版 Gemma")) {
+          transcript.textContent = spoken;
+          status.textContent = "这一段的文字在上面。网页版 Gemma 权重不在，还不能另写总结。";
+          return;
+        }
+        transcript.textContent = `${spoken}\n\n总结\n${summary}`;
+        status.textContent = session.gemmaResident ? "Gemma 仍驻留" : "总结完成";
+      } catch {
+        status.textContent = "总结没有跑起来";
+      }
+    });
+
+    let downloading = false;
+    downloadButton.addEventListener("click", async () => {
+      if (downloading) return;
+      downloading = true;
+      downloadButton.disabled = true;
+      gemmaProgress.textContent = "正在下载 Gemma 4 E2B…";
+      try {
+        const response = await fetch(`/download/${gemmaWebFile}`);
+        if (!response.ok || !response.body) throw new Error("download failed");
+        const total = Number(response.headers.get("content-length")) || 0;
+        const reader = response.body.getReader();
+        const chunks = [];
+        let received = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          received += value.byteLength;
+          const amount = total ? `${Math.floor((received / total) * 100)}%` : `${Math.floor(received / 1000000)} MB`;
+          gemmaProgress.textContent = `正在下载 Gemma 4 E2B ${amount}`;
+        }
+        if (total && received !== total) throw new Error("short download");
+        session.setSummaryModel(new Blob(chunks, { type: "application/octet-stream" }));
+        downloadButton.textContent = "Gemma 4 E2B 已下载";
+        gemmaProgress.textContent = "Gemma 4 E2B 已下载，可以点总结。";
+      } catch {
+        downloading = false;
+        downloadButton.disabled = false;
+        gemmaProgress.textContent = "Gemma 4 E2B 没有下载下来。";
+      }
+    });
+  </script>
+</body>
+</html>
