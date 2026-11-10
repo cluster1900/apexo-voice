@@ -2,8 +2,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { createSession } from "../src/index.js";
-import { SUMMARY_INSTRUCTION } from "../src/session.js";
+import { createSession, SUMMARY_SYNTHESIS_INSTRUCTION } from "../src/index.js";
 import { createOnlineRecognizer } from "sherpa-onnx";
 
 const fake = globalThis.__apexoFake || (globalThis.__apexoFake = {
@@ -53,6 +52,7 @@ expect(bareConfigThrew, "sherpa-onnx rejects a recognizer config without modelCo
 const session = createSession({
   summaryModelPath: gemma,
   asrModelPath: asrDir,
+  litertWasmUrl: "https://example.test/meeting/assets/apexo/litert/",
   webSummary: true,
 });
 await session.loadRecognizer();
@@ -73,10 +73,22 @@ const wide = new Float32Array(4800);
 const widePush = session.pushPcm(wide, 48000);
 expect(widePush === 0 && fake.accepts[1].sampleRate === 16000 && fake.accepts[1].length <= 1600 && fake.accepts[1].length >= 1584, "pushPcm resamples to 16 kHz before sherpa-onnx");
 
+// Test explicit endSegment() with noEndpoint -> flushes tail via inputFinished
+fake.noEndpoint = true;
+fake.finishText = "尾词收尾完整";
+session.pushPcm(pcm, 16000);
+expect(!session.fullTranscript.includes("尾词收尾完整"), "unfinished speech is interim before endSegment");
+await session.endSegment();
+expect(session.fullTranscript.includes("尾词收尾完整") && fake.inputFinishedCount === 1,
+       "endSegment flushes tail frames via stream.inputFinished()");
+fake.noEndpoint = false;
+
 const result = await session.summarizeWithGemma(gemma);
 expect(fake.models.length === 1 && fake.models[0] === gemma, "summarize loads the web .litertlm");
+expect(fake.wasmUrls.includes("https://example.test/meeting/assets/apexo/litert/"),
+       "custom litertWasmUrl is passed to getOrLoadGlobalLiteRtLm");
 expect(typeof result.summary === "string" && result.summary.includes("适配器摘要"), "LiteRT-LM generation is returned");
-expect(fake.prompts.length >= 1 && fake.prompts[0].startsWith(SUMMARY_INSTRUCTION), "generates from the transcript-only prompt");
+expect(fake.prompts.length >= 1 && fake.prompts[0].startsWith(SUMMARY_SYNTHESIS_INSTRUCTION), "generates from the transcript-only prompt");
 expect(fake.prompts[0].includes("适配器转写") && !fake.prompts[0].includes("pcm"), "text-only-summary");
 expect(fake.deleted === 1, "unloads");
 expect(session.gemmaResident === false, "Gemma unloads after summarize");
@@ -93,10 +105,24 @@ await absent.loadRecognizer({ tokens: join(dir, "no-asr-model", "tokens.txt") })
 expect(absent.pushPcm(new Float32Array(1600), 16000) === -3 && absent.displayText === "", "missing asr model returns -3 and paints nothing");
 expect(absent.lastError.includes("missing"), "missing asr model says why");
 absent.pushAsrEvent({ isFinal: 1, text: "今天开会", startMs: 0, endMs: 800 });
-const noModel = await absent.summarizeWithGemma(missing);
-expect(noModel.summary === -3 && absent.lastError.includes("not found"), "missing summary model returns -3, not a made-up summary");
+let missingCode = 0;
+try {
+  await absent.summarize();
+} catch (err) {
+  missingCode = err.code;
+}
+expect(missingCode === -3 && absent.lastError.includes("not found"), "missing summary model rejects with code === -3, not a made-up summary");
 expect(fake.models.length === modelsBefore, "missing web model does not call Engine.create");
 expect(fake.deleted === deletedBefore, "missing web model does not unload an engine it did not load");
+
+// Summary-only scenario: external text summary works without ASR model files
+const textOnlySession = createSession({
+  summaryModelPath: gemma,
+  webSummary: true,
+});
+const extSummary = await textOnlySession.summarize("这是一段不需要ASR模型的外部会议纪要文本。");
+expect(extSummary.includes("适配器摘要") && textOnlySession.fullTranscript === "" && textOnlySession.summaryText === "",
+       "summarize(text) summarizes external text without loading ASR or mutating session state");
 
 const weights = new Blob(["gemma-4-e2b"]);
 const fromDownload = createSession({

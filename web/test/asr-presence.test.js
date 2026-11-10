@@ -1,9 +1,11 @@
 import { spawn } from "node:child_process";
-import { mkdirSync, readdirSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { createSession, probeAsrFile, presenceFromProbes, requiredAsrFiles } from "../src/index.js";
+import { copyApexoRuntime } from "../scripts/copy-runtime.mjs";
 
 const CANNED = "你好，这是已经成稿的一句。";
 const demoRoot = fileURLToPath(new URL("../demo/", import.meta.url));
@@ -39,6 +41,24 @@ expect(
   "requiredAsrFiles names the four model files and not the directory",
 );
 
+// T10: copy-runtime.mjs copies sherpa-onnx and @litert-lm/core runtime files into a custom directory.
+const runtimeTmp = mkdtempSync(join(tmpdir(), "apexo-runtime-"));
+try {
+  const { sherpaDir, litertDir } = copyApexoRuntime(join(runtimeTmp, "meeting/assets/apexo"), {
+    fromDir: fileURLToPath(new URL("..", import.meta.url)),
+  });
+  expect(
+    existsSync(join(sherpaDir, "sherpa-onnx-wasm-nodejs.js")) &&
+      existsSync(join(sherpaDir, "sherpa-onnx-asr.js")) &&
+      existsSync(join(sherpaDir, "sherpa-onnx-wasm-nodejs.wasm")) &&
+      existsSync(litertDir) &&
+      readdirSync(litertDir).some((n) => n.endsWith(".wasm") || n.endsWith(".js")),
+    "T10: copy-runtime.mjs copies sherpa and litert runtime assets into custom target directory",
+  );
+} finally {
+  rmSync(runtimeTmp, { recursive: true, force: true });
+}
+
 mkdirSync(asrDir, { recursive: true });
 for (const name of names) writeFileSync(join(asrDir, name), "not-a-model");
 
@@ -72,7 +92,7 @@ try {
   });
 
   async function headStatus(url) {
-    const response = await fetch(url, { method: "HEAD", headers: { "X-Apexo-Probe": "1" } });
+    const response = await fetch(url, { method: "HEAD" });
     return response.status;
   }
 
@@ -83,7 +103,7 @@ try {
   }
   const directoryStatus = await headStatus(base);
   const directoryProbe = await probeAsrFile(base);
-  expect(directoryStatus === 204 && directoryProbe === false, "HEAD asr-model directory is 204 and probeAsrFile is absent");
+  expect(directoryStatus === 404 && directoryProbe === false, "HEAD asr-model directory is 404 (not a file) and probeAsrFile is absent");
 
   const present = createSession({
     summaryModelPath: "gemma-4-E2B-it-web.litertlm",

@@ -10,6 +10,8 @@ extern "C" {
 #if defined(_WIN32)
 #if defined(APEXO_BUILDING)
 #define APEXO_API __declspec(dllexport)
+#elif defined(APEXO_STATIC_ENGINES) || defined(APEXO_STATIC)
+#define APEXO_API
 #else
 #define APEXO_API __declspec(dllimport)
 #endif
@@ -23,6 +25,8 @@ extern "C" {
 #define APEXO_DISPLAY_LINES 4
 #define APEXO_DISPLAY_WORDS 200
 
+#define APEXO_ERR_BUSY (-6)
+
 typedef struct ApexoSession ApexoSession;
 
 typedef struct ApexoAsrEvent {
@@ -31,6 +35,8 @@ typedef struct ApexoAsrEvent {
   int32_t start_ms;
   int32_t end_ms;
 } ApexoAsrEvent;
+
+typedef void (*ApexoTranscriptCallback)(void* user, const ApexoAsrEvent* event);
 
 typedef struct ApexoEngines {
   void* asr_user;
@@ -41,6 +47,7 @@ typedef struct ApexoEngines {
   int (*sum_load)(void* user, const char* model_path);
   int (*sum_unload)(void* user);
   int (*sum_generate)(void* user, const char* prompt, char* out, int32_t out_cap);
+  int (*asr_finish)(void* user, ApexoAsrEvent* out);
 } ApexoEngines;
 
 typedef struct ApexoConfig {
@@ -55,30 +62,41 @@ typedef struct ApexoConfig {
 
 APEXO_API ApexoSession* apexo_session_create(const ApexoConfig* config, const ApexoEngines* engines);
 APEXO_API void apexo_session_destroy(ApexoSession* session);
+APEXO_API void apexo_session_set_transcript_callback(ApexoSession* session, ApexoTranscriptCallback callback,
+                                                     void* user);
 APEXO_API int apexo_session_push_pcm(ApexoSession* session, const float* pcm, int32_t count, int32_t sample_rate);
 APEXO_API int apexo_session_end_segment(ApexoSession* session);
 APEXO_API int apexo_session_gemma_resident(const ApexoSession* session);
 APEXO_API const char* apexo_session_display_text(const ApexoSession* session);
 APEXO_API const char* apexo_session_full_transcript(const ApexoSession* session);
 APEXO_API const char* apexo_session_summary_text(const ApexoSession* session);
+/* Summarizes the snapshot of finalized transcript (full_transcript) without modifying interim text, ASR state,
+ * or blocking push_pcm. Replaces summary_text and advances the incremental cursor to the snapshot end. */
 APEXO_API int apexo_session_summarize(ApexoSession* session, char* out, int32_t out_cap);
-/* Summarizes the transcript added since the last summary and appends to summary_text. A line still being
- * recognized is closed first (as end_segment does) and included. Does not stop or block live push_pcm calls while
- * running. */
+/* Summarizes caller-supplied UTF-8 text without reading or modifying full_transcript, summary_text, incremental
+ * cursor, interim text, or ASR state. Empty string writes "" and returns 0 without loading the model. */
+APEXO_API int apexo_session_summarize_text(ApexoSession* session, const char* text, char* out, int32_t out_cap);
+/* Summarizes the finalized transcript added since the last summary snapshot and appends to summary_text.
+ * Does not modify interim text, reset ASR, or block live push_pcm calls while running. */
 APEXO_API int apexo_session_summarize_new(ApexoSession* session, char* out, int32_t out_cap);
+/* Clears transcript, summary, incremental cursor and interim state, and resets ASR timeline to 0 while keeping
+ * any loaded recognizer ready for the next recording. */
+APEXO_API void apexo_session_reset(ApexoSession* session);
+/* Compatibility alias for apexo_session_reset. */
 APEXO_API void apexo_session_release(ApexoSession* session);
 APEXO_API const char* apexo_session_last_error(const ApexoSession* session);
 
 /* Default engines dlopen sherpa-onnx and LiteRT-LM (LiteRT-LM C API 1.0.0 or newer).
  *
- * asr_model_dir must hold encoder.onnx, decoder.onnx, joiner.onnx and tokens.txt. If any file is missing,
- * push_pcm returns -3 and the transcript stays empty. Nothing is invented. A missing summary model file makes
- * summarize return -3 as well.
+ * asr_model_dir must hold encoder.onnx, decoder.onnx, joiner.onnx and tokens.txt when ASR is used; pass NULL or ""
+ * for summary-only usage. If any ASR file is missing when push_pcm is called, push_pcm returns -3 and the transcript
+ * stays empty. Nothing is invented. A missing summary model file makes summarize return -3 as well.
  *
  * Threading: one session may be used from several threads (for example capture on one, summarize on another).
- * push_pcm is refused with -5 while Gemma is resident, and only one summarize runs at a time. summarize blocks
- * its caller while the model runs, so do not call it on a UI thread. Strings returned by display_text,
- * full_transcript and last_error stay valid until the next call that changes the session. */
+ * Live push_pcm continues while Gemma runs; only one summary call (summarize, summarize_text, or summarize_new)
+ * runs at a time, and concurrent summary calls return APEXO_ERR_BUSY (-6). summarize blocks its caller while the
+ * model runs, so do not call it on a UI thread. Strings returned by display_text, full_transcript, summary_text
+ * and last_error stay valid until the next call that changes the session. */
 APEXO_API void* apexo_engine_state_create(const char* asr_model_dir, const char* gemma_path);
 APEXO_API void apexo_engine_state_destroy(void* state);
 /* Where to dlopen the engines from, instead of the default names or APEXO_SHERPA_LIBRARY and

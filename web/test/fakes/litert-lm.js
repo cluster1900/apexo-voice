@@ -1,8 +1,13 @@
 function bag() {
   if (!globalThis.__apexoFake) {
-    globalThis.__apexoFake = { accepts: [], vad: [], models: [], prompts: [], deleted: 0, creates: 0, resets: 0 };
+    globalThis.__apexoFake = { accepts: [], vad: [], models: [], prompts: [], wasmUrls: [], deleted: 0, creates: 0, resets: 0 };
   }
+  if (!globalThis.__apexoFake.wasmUrls) globalThis.__apexoFake.wasmUrls = [];
   return globalThis.__apexoFake;
+}
+
+export async function getOrLoadGlobalLiteRtLm(url) {
+  bag().wasmUrls.push(url);
 }
 
 export class Engine {

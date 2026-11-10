@@ -3,3 +3,6 @@ dist/
 **/build/
 *.litertlm
 .DS_Store
+examples/macos/minimal_example
+web/demo/asr-model
+web/demo/test.wav

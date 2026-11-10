@@ -1,8 +1,26 @@
-import { createSession as createCore, isLiteRtLmFile, SUMMARY_INSTRUCTION } from "./session.js";
+import {
+  createSession as createCore,
+  isLiteRtLmFile,
+  SUMMARY_INSTRUCTION,
+  SUMMARY_CHUNK_INSTRUCTION,
+  SUMMARY_SYNTHESIS_INSTRUCTION,
+  ERR_BUSY,
+  createApexoError,
+} from "./session.js";
 import { createStreamingResampler, resampleTo16k } from "./resample.js";
 import { createAsrPipeline, onlineRecognizerConfig, requiredAsrFiles } from "./asr-pipeline.js";
 
-export { createStreamingResampler, resampleTo16k, isLiteRtLmFile, requiredAsrFiles, SUMMARY_INSTRUCTION };
+export {
+  createStreamingResampler,
+  resampleTo16k,
+  isLiteRtLmFile,
+  requiredAsrFiles,
+  SUMMARY_INSTRUCTION,
+  SUMMARY_CHUNK_INSTRUCTION,
+  SUMMARY_SYNTHESIS_INSTRUCTION,
+  ERR_BUSY,
+  createApexoError,
+};
 
 export function presenceFromProbes(flags) {
   const files = ["encoder", "decoder", "joiner", "tokens"];
@@ -18,7 +36,8 @@ export async function probeAsrFile(path) {
     return fs.statSync(path).isFile();
   }
   try {
-    const response = await fetch(path, { method: "HEAD", headers: { "X-Apexo-Probe": "1" } });
+    const response = await fetch(path, { method: "HEAD" });
+    if (response.status === 405 || response.status === 501) return true;
     if (response.status !== 200) return false;
     // Many servers answer a missing file with their index page and status 200. A model file is never HTML.
     return !(response.headers.get("content-type") || "").toLowerCase().startsWith("text/html");
@@ -38,36 +57,50 @@ function asrDirectory(asrModelPath, modelConfig) {
 const isNode = () => Boolean(globalThis.process?.versions?.node);
 
 // Runs sherpa-onnx in a module worker. Decoded events come back asynchronously; `gen` drops events that belong
-// to audio from before the last release.
-function startWorkerRecognizer({ files, sherpaUrl, onEvent, onEnd, onFail }) {
+// to audio from before the last reset/release.
+function startWorkerRecognizer({ files, sherpaUrl, onEvent, onFail }) {
   const worker = new Worker(new URL("./asr-worker.js", import.meta.url), { type: "module" });
   let gen = 0;
   let syncId = 0;
+  let endId = 0;
   const syncs = new Map();
+  const ends = new Map();
   const settleSyncs = () => {
     for (const resolve of syncs.values()) resolve();
     syncs.clear();
+  };
+  const settleEnds = (err) => {
+    for (const entry of ends.values()) {
+      if (err) entry.reject(err);
+      else entry.resolve();
+    }
+    ends.clear();
   };
   const ready = new Promise((resolve, reject) => {
     worker.onmessage = (message) => {
       const data = message.data;
       if (data.type === "ready") resolve();
       else if (data.type === "error") {
-        const error = new Error(data.message);
+        const error = createApexoError(-5, data.message || "the recognizer worker failed");
         if (data.stack) error.workerStack = data.stack;
         reject(error);
         onFail(error);
+        settleSyncs();
+        settleEnds(error);
       } else if (data.type === "event" && data.gen === gen) onEvent(data.event);
-      else if (data.type === "end" && data.gen === gen && typeof onEnd === "function") onEnd();
-      else if (data.type === "synced") {
+      else if (data.type === "end") {
+        const pending = ends.get(data.id);
+        ends.delete(data.id);
+        pending?.resolve();
+      } else if (data.type === "synced") {
         syncs.get(data.id)?.();
         syncs.delete(data.id);
       }
-      if (data.type === "error") settleSyncs();
     };
     worker.onerror = (event) => {
+      const error = createApexoError(-5, event.message || "the recognizer worker failed");
       settleSyncs();
-      const error = new Error(event.message || "the recognizer worker failed");
+      settleEnds(error);
       reject(error);
       onFail(error);
     };
@@ -80,10 +113,15 @@ function startWorkerRecognizer({ files, sherpaUrl, onEvent, onEnd, onFail }) {
       return null;
     },
     end() {
-      worker.postMessage({ type: "end", gen });
+      return new Promise((resolve, reject) => {
+        const id = (endId += 1);
+        ends.set(id, { resolve, reject });
+        worker.postMessage({ type: "end", gen, id });
+      });
     },
     reset() {
       gen += 1;
+      settleEnds();
       worker.postMessage({ type: "reset", gen });
     },
     // Resolves after the worker has decoded all audio sent so far and its results have reached this thread.
@@ -97,6 +135,7 @@ function startWorkerRecognizer({ files, sherpaUrl, onEvent, onEnd, onFail }) {
     free() {
       worker.terminate();
       settleSyncs();
+      settleEnds();
     },
   };
 }
@@ -144,11 +183,12 @@ function readGeneratedText(response) {
 }
 
 export function createSession(options = {}) {
-  const summaryModelPath = options.summaryModelPath || "gemma-4-E2B-it-gpu.litertlm";
+  const summaryModelPath = options.summaryModelPath ?? "gemma-4-E2B-it-gpu.litertlm";
+  const litertWasmUrl = options.litertWasmUrl;
   const custom = options.engines;
   let sherpaModule = null;
   let recognizer = null;
-  let backend = null; // { push(pcm) -> event | null, reset(), free() }
+  let backend = null; // { push(pcm) -> event | null, finish?(), end?(), reset(), free() }
   let asrMode = "unknown"; // unknown | missing | live | failed
   let modelExists = false;
   let pendingLitert = null;
@@ -157,36 +197,77 @@ export function createSession(options = {}) {
   let liveConversation = null;
   let callModel = null; // model path passed to summarizeWithGemma for the call that is running
   let localError = "";
-  let finalizingWorker = false;
   const resampleStream = createStreamingResampler();
+
+  async function drain() {
+    if (!custom && asrMode === "live" && backend && typeof backend.sync === "function") await backend.sync();
+  }
 
   const defaultEngines = {
     asrPush(pcm) {
       if (asrMode !== "live" || !backend) return { isFinal: -1, text: "", startMs: 0, endMs: 0 };
       return backend.push(pcm) || { isFinal: -1, text: "", startMs: 0, endMs: 0 };
     },
+    async asrFinish() {
+      if (asrMode === "failed") {
+        throw createApexoError(-5, "the recognizer failed to load");
+      }
+      if (asrMode !== "live" || !backend) {
+        return { fallback: true };
+      }
+      if (typeof backend.finish === "function") {
+        return backend.finish();
+      }
+      if (typeof backend.end === "function") {
+        await backend.end();
+        return { isFinal: -1, text: "", startMs: 0, endMs: 0 };
+      }
+      return { fallback: true };
+    },
     asrReset() {
-      if (!backend || finalizingWorker) return;
-      if (typeof backend.end === "function") backend.end();
-      else backend.reset();
+      if (!backend) return;
+      if (typeof backend.reset === "function") backend.reset();
+    },
+    async beforeSnapshot() {
+      await drain();
+    },
+    async beforeSummarize(chosenPath) {
+      const path = chosenPath || summaryModelPath;
+      let litert = null;
+      let importErr = null;
+      try {
+        litert = await import("@litert-lm/core");
+      } catch (err) {
+        importErr = err;
+      }
+      const override = chosenPath && chosenPath !== summaryModelPath ? chosenPath : null;
+      modelExists = override ? await probeAsrFile(path) : downloadedSummary != null || (await probeAsrFile(path));
+      pendingLitert = litert;
+      callModel = override;
+      localError = "";
+      if (importErr && modelExists) {
+        throw createApexoError(-5, importErr.message || "gemma failed to load");
+      }
     },
     // 0: loaded. -3: the model file is not there. -5: it is there but could not be loaded.
     sumLoad(path) {
       if (!modelExists) return -3;
       const create = pendingLitert?.Engine?.create;
       if (typeof create !== "function") return -5;
-      const chosen = callModel; // read now: another call may change it while this one loads
-      return prepareWebGemmaRuntime(pendingLitert)
+      const chosen = callModel; // read now: another call cannot enter while summarizing is true
+      return prepareWebGemmaRuntime(pendingLitert, litertWasmUrl)
         .then(() => (chosen ? chosen : resolveModelSource(downloadedSummary, path)))
         .then((model) => create.call(pendingLitert.Engine, { model }))
         .then(async (engine) => {
           liveEngine = engine;
           liveConversation = await engine.createConversation();
           return 0;
+        })
+        .finally(() => {
+          callModel = null;
         });
     },
-    // The conversation must be destroyed before its engine. The returned promise settles when both are gone, so
-    // the session does not take PCM again while the weights are still being freed.
+    // The conversation must be destroyed before its engine.
     async sumUnload() {
       const conversation = liveConversation;
       const engine = liveEngine;
@@ -228,6 +309,7 @@ export function createSession(options = {}) {
     displayLines: options.displayLines,
     summaryModelPath,
     webSummary: options.webSummary !== false,
+    onTranscript: options.onTranscript,
     engines: custom || defaultEngines,
   });
 
@@ -245,16 +327,6 @@ export function createSession(options = {}) {
 
   function onWorkerEvent(event) {
     core.pushAsrEvent(event);
-    if (typeof options.onChange === "function") options.onChange();
-  }
-
-  function onWorkerEnd() {
-    finalizingWorker = true;
-    try {
-      core.endSegment();
-    } finally {
-      finalizingWorker = false;
-    }
     if (typeof options.onChange === "function") options.onChange();
   }
 
@@ -292,17 +364,21 @@ export function createSession(options = {}) {
         const pipeline = createAsrPipeline(recognizer);
         backend = {
           push: (pcm) => pipeline.push(pcm),
+          finish: () => pipeline.finish(),
           reset: () => pipeline.reset(),
           free: () => pipeline.free(),
         };
       } else {
         if (typeof Worker === "undefined") throw new Error("this browser has no Worker");
-        const sherpaUrl = options.sherpaUrl || new URL("/vendor/sherpa-onnx/", globalThis.location.href).href;
+        const sherpaUrl = options.sherpaUrl
+          ? new URL(options.sherpaUrl, globalThis.location.href).href
+          : new URL("/vendor/sherpa-onnx/", globalThis.location.href).href;
         backend = startWorkerRecognizer({
-          files: Object.fromEntries(Object.entries(files).map(([key, path]) => [key, new URL(path, globalThis.location.href).href])),
+          files: Object.fromEntries(
+            Object.entries(files).map(([key, path]) => [key, new URL(path, globalThis.location.href).href]),
+          ),
           sherpaUrl,
           onEvent: onWorkerEvent,
-          onEnd: onWorkerEnd,
           onFail: onWorkerFail,
         });
         await backend.ready;
@@ -317,41 +393,13 @@ export function createSession(options = {}) {
     return sherpaModule || backend;
   }
 
-  async function drain() {
-    if (!custom && asrMode === "live" && backend && typeof backend.sync === "function") await backend.sync();
-  }
-
-  async function summarizeWithGemma(model, { incremental = false } = {}) {
-    const path = model || summaryModelPath;
-    if (!isLiteRtLmFile(path)) {
-      throw new Error("the summary model must be a .litertlm file");
-    }
-    let litert = null;
-    try {
-      litert = await import("@litert-lm/core");
-    } catch (error) {
-      if (downloadedSummary != null || await probeAsrFile(path)) throw error;
-    }
-    // A model other than the configured one replaces both the configured path and any downloaded bytes for this
-    // call. Passing the configured name keeps using the bytes the page downloaded for it.
-    const override = model && model !== summaryModelPath ? model : null;
-    if (!custom) {
-      modelExists = override ? await probeAsrFile(path) : downloadedSummary != null || await probeAsrFile(path);
-      pendingLitert = litert;
-    }
-    localError = "";
-    // A rolling summary includes the line still being recognized. With the worker, closing it is asynchronous
-    // (endSegment below), and drain waits until the worker has closed it.
-    if (incremental && !custom && asrMode === "live" && backend && typeof backend.end === "function") api.endSegment();
-    // Speech sent just before (even right after endSegment) may still be in the recognizer worker.
-    await drain();
-    callModel = override;
-    try {
-      const summary = await Promise.resolve(incremental ? core.summarizeNew() : core.summarize());
-      return { litert, summary };
-    } finally {
-      callModel = null;
-    }
+  async function summarizeWithGemma(model, { incremental = false, text } = {}) {
+    const summary = await core.summarizeInternal({
+      text,
+      incremental,
+      overrideModel: model || undefined,
+    });
+    return { litert: pendingLitert, summary };
   }
 
   const api = {
@@ -373,13 +421,15 @@ export function createSession(options = {}) {
     get recognizerState() {
       return asrMode;
     },
-    // -3: no recognizer (model files missing or not loaded yet). -5: the recognizer failed, or Gemma is resident.
+    setTranscriptListener(listener) {
+      core.setTranscriptListener(listener);
+    },
+    // -3: no recognizer (model files missing or not loaded yet). -5: the recognizer failed to load.
     pushPcm(samples, sampleRate) {
       if (!samples || typeof sampleRate !== "number" || sampleRate < 16000) {
         return core.pushPcm(samples, sampleRate);
       }
       localError = "";
-      if (core.gemmaResident) return core.pushPcm(new Float32Array(0), 16000);
       if (!custom && asrMode !== "live") {
         if (asrMode === "failed") {
           localError = "the recognizer failed to load";
@@ -395,48 +445,35 @@ export function createSession(options = {}) {
     pushAsrEvent(event) {
       return core.pushAsrEvent(event);
     },
-    endSegment() {
+    async endSegment() {
       const tail = resampleStream.flush();
-      if (tail.length && (custom || asrMode === "live") && !core.gemmaResident) {
+      if (tail.length && (custom || asrMode === "live")) {
         core.pushPcm(tail, 16000);
       }
-      // The worker may still hold audio of this utterance (and the tail just sent). Closing the line now would let
-      // those results open a second copy of it, so the worker's "end" reply closes the segment after them.
-      if (!custom && asrMode === "live" && backend && typeof backend.end === "function") {
-        backend.end();
-        return 0;
-      }
-      return core.endSegment();
+      await core.endSegment();
+      if (typeof options.onChange === "function") options.onChange();
     },
-    summarize() {
-      if (custom) return core.summarize();
-      return summarizeWithGemma().then((result) => result.summary);
+    summarize(text) {
+      return core.summarize(text);
     },
     summarizeNew() {
-      if (custom) return core.summarizeNew();
-      return summarizeWithGemma(undefined, { incremental: true }).then((result) => result.summary);
+      return core.summarizeNew();
     },
-    // Clears the transcript and the recognizer state. The recognizer stays loaded for the next recording.
-    release() {
+    // Clears the transcript, summary, cursor and recognizer state while keeping any loaded recognizer ready.
+    reset() {
       resampleStream.flush();
-      if (backend) backend.reset();
-      finalizingWorker = true;
-      try {
-        core.release();
-      } finally {
-        finalizingWorker = false;
-      }
+      localError = "";
+      core.reset();
     },
-    // Frees the recognizer and the Gemma engine. Call it when the session is no longer needed.
-    dispose() {
-      if (backend) backend.reset();
-      finalizingWorker = true;
-      try {
-        core.release();
-      } finally {
-        finalizingWorker = false;
-      }
-      defaultEngines.sumUnload();
+    // Compatibility alias for reset().
+    release() {
+      api.reset();
+    },
+    // Frees the recognizer and waits for any in-flight summary to finish unloading its Gemma engine.
+    async dispose() {
+      resampleStream.flush();
+      localError = "";
+      await core.dispose();
       freeRecognizer();
       if (asrMode === "live") asrMode = "unknown";
     },
@@ -450,8 +487,14 @@ export function createSession(options = {}) {
   return api;
 }
 
-function prepareWebGemmaRuntime(litert) {
+function prepareWebGemmaRuntime(litert, litertWasmUrl) {
   if (!litert || typeof litert.getOrLoadGlobalLiteRtLm !== "function") return Promise.resolve();
-  if (typeof document === "undefined" || typeof location === "undefined" || !location.href) return Promise.resolve();
-  return litert.getOrLoadGlobalLiteRtLm(new URL("/vendor/@litert-lm/core/wasm/", location.href).href);
+  const rawUrl = litertWasmUrl || "/vendor/@litert-lm/core/wasm/";
+  if (typeof location !== "undefined" && location.href) {
+    return litert.getOrLoadGlobalLiteRtLm(new URL(rawUrl, location.href).href);
+  }
+  if (litertWasmUrl) {
+    return litert.getOrLoadGlobalLiteRtLm(rawUrl);
+  }
+  return Promise.resolve();
 }

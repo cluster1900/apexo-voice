@@ -8,8 +8,19 @@
 
 namespace {
 
-const char* kInstruction =
-    "只根据下面的转写写摘要。转写里没有的内容不要补。\n转写：\n";
+const char* kChunkInstruction =
+    "仅依据以下转写提取简洁事实摘要。\n"
+    "保留决定、待办、明确的负责人和时间，以及对先前决定的修改或撤销。\n"
+    "没有明确给出的信息不要补充；尚未确定的事项保持未确定。\n"
+    "按原文发生顺序概括，保留“取消”“改为”“最终决定”等关系。\n"
+    "转写：\n";
+
+const char* kSynthesizeInstruction =
+    "以下内容按会议发生顺序排列。请归纳成一份简洁的会议总结。\n"
+    "合并重复事项；对于明确被后续内容修改或撤销的决定，以最后明确决定为准。\n"
+    "保留仍未确定或互相矛盾且没有结论的事项，不自行猜测。\n"
+    "只写材料中有依据的要点、最终决定和待办，不补负责人或日期。\n"
+    "材料：\n";
 
 int utf8_len(unsigned char lead) {
   if ((lead & 0x80) == 0) return 1;
@@ -195,6 +206,40 @@ std::string strip_label(const std::string& text) {
   return text.substr(start);
 }
 
+size_t utf8_char_count(const std::string& text) {
+  size_t count = 0;
+  for (size_t i = 0; i < text.size();) {
+    int len = utf8_len(static_cast<unsigned char>(text[i]));
+    if (i + static_cast<size_t>(len) > text.size()) len = 1;
+    i += static_cast<size_t>(len);
+    count += 1;
+  }
+  return count;
+}
+
+bool is_blank_text(const std::string& text) {
+  for (char c : text) {
+    if (c != ' ' && c != '\n' && c != '\r' && c != '\t') return false;
+  }
+  return true;
+}
+
+void fill_callback_event(ApexoAsrEvent* out, const std::string& text, int32_t is_final, int32_t start_ms,
+                         int32_t end_ms) {
+  std::memset(out, 0, sizeof(*out));
+  size_t len = text.size();
+  const size_t cap = sizeof(out->text) - 1;
+  if (len > cap) {
+    len = cap;
+    while (len > 0 && (static_cast<unsigned char>(text[len]) & 0xC0) == 0x80) --len;
+  }
+  std::memcpy(out->text, text.data(), len);
+  out->text[len] = '\0';
+  out->is_final = is_final;
+  out->start_ms = start_ms;
+  out->end_ms = end_ms;
+}
+
 struct Segment {
   int32_t start_ms;
   int32_t end_ms;
@@ -212,9 +257,11 @@ struct ApexoSession {
   int32_t display_words;
   std::string model_path;
   int32_t web_summary;
-  /* mu guards everything below except the two atomics. Engine calls for transcription run under it, so
+  /* mu guards everything below except the atomics. Engine calls for transcription run under it, so
    * concurrent callers are serialized. summarize() does not hold it while Gemma runs. */
   mutable std::mutex mu;
+  ApexoTranscriptCallback transcript_cb = nullptr;
+  void* transcript_user = nullptr;
   std::vector<Segment> segments;
   std::string interim;
   int32_t interim_start = 0;
@@ -230,7 +277,6 @@ struct ApexoSession {
   /* One reference for the host plus one per running summary. Whoever drops the last one frees the session, so
    * destroy() during a summary never frees memory that summary is still using. */
   std::atomic<int> refs{1};
-  int reset_calls = 0;
 };
 
 static void refresh_display(ApexoSession* session) {
@@ -252,14 +298,14 @@ static void refresh_display(ApexoSession* session) {
   session->display = trim_words(session->display, session->display_words);
 }
 
-static void accept_final(ApexoSession* session, const std::string& text, int32_t start_ms, int32_t end_ms) {
+static bool accept_final(ApexoSession* session, const std::string& text, int32_t start_ms, int32_t end_ms) {
   session->interim.clear();
   session->interim_start = 0;
   session->interim_end = 0;
   /* A final with no words (for example an endpoint fired by silence) carries nothing to keep. */
   if (text.empty()) {
     refresh_display(session);
-    return;
+    return false;
   }
   /* A repeat is only dropped when the audio really overlaps the previous final (the recognizer reported the same
    * stretch of speech twice). Two utterances that merely sit close together are both kept, even when they read
@@ -269,7 +315,7 @@ static void accept_final(ApexoSession* session, const std::string& text, int32_t
     if (start_ms >= last.start_ms && start_ms < last.end_ms && last.text.size() >= text.size() &&
         last.text.compare(last.text.size() - text.size(), text.size(), text) == 0) {
       refresh_display(session);
-      return;
+      return false;
     }
   }
   if (!session->full.empty()) session->full.push_back('\n');
@@ -281,7 +327,7 @@ static void accept_final(ApexoSession* session, const std::string& text, int32_t
       append_joined(&last.text, text);
       last.end_ms = end_ms;
       refresh_display(session);
-      return;
+      return true;
     }
   }
   Segment segment;
@@ -290,19 +336,23 @@ static void accept_final(ApexoSession* session, const std::string& text, int32_t
   segment.text = text;
   session->segments.push_back(segment);
   refresh_display(session);
+  return true;
 }
 
-static void accept_event(ApexoSession* session, const ApexoAsrEvent& event) {
-  if (event.is_final < 0) return;
+static bool accept_event(ApexoSession* session, const ApexoAsrEvent& event, ApexoAsrEvent* cb_out) {
+  if (event.is_final < 0) return false;
   const std::string text(event.text, strnlen(event.text, sizeof(event.text)));
   if (event.is_final == 0) {
     session->interim = text;
     session->interim_start = event.start_ms;
     session->interim_end = event.end_ms;
     refresh_display(session);
-    return;
+    if (cb_out != nullptr) fill_callback_event(cb_out, text, 0, event.start_ms, event.end_ms);
+    return true;
   }
-  accept_final(session, text, event.start_ms, event.end_ms);
+  const bool accepted = accept_final(session, text, event.start_ms, event.end_ms);
+  if (accepted && cb_out != nullptr) fill_callback_event(cb_out, text, 1, event.start_ms, event.end_ms);
+  return accepted;
 }
 
 static void set_error(ApexoSession* session, const char* message) {
@@ -351,6 +401,13 @@ void apexo_session_destroy(ApexoSession* session) {
   unref_session(session);
 }
 
+void apexo_session_set_transcript_callback(ApexoSession* session, ApexoTranscriptCallback callback, void* user) {
+  if (session == nullptr) return;
+  std::lock_guard<std::mutex> lock(session->mu);
+  session->transcript_cb = callback;
+  session->transcript_user = user;
+}
+
 int apexo_session_push_pcm(ApexoSession* session, const float* pcm, int32_t count, int32_t sample_rate) {
   if (session == nullptr || pcm == nullptr || count < 0) return -1;
   if (sample_rate != APEXO_SAMPLE_RATE) {
@@ -361,42 +418,90 @@ int apexo_session_push_pcm(ApexoSession* session, const float* pcm, int32_t coun
     set_error(session, "recognizer is not attached");
     return -3;
   }
-  std::lock_guard<std::mutex> lock(session->mu);
-  if (session->gemma_resident.load()) {
-    session->error = "gemma is resident; live transcription does not run beside it";
-    return -5;
+  ApexoTranscriptCallback cb = nullptr;
+  void* cb_user = nullptr;
+  ApexoAsrEvent cb_event;
+  bool notify = false;
+  {
+    std::lock_guard<std::mutex> lock(session->mu);
+    ApexoAsrEvent event;
+    std::memset(&event, 0, sizeof(event));
+    event.is_final = -1;
+    const int rc = session->engines.asr_push(session->engines.asr_user, pcm, count, sample_rate, &event);
+    if (rc != 0) {
+      session->error = rc == -3 ? "recognizer model files are missing"
+                                : (rc == -5 ? "recognizer failed to load" : "recognizer rejected pcm");
+      return rc;
+    }
+    notify = accept_event(session, event, &cb_event);
+    cb = session->transcript_cb;
+    cb_user = session->transcript_user;
+    session->error.clear();
   }
-  ApexoAsrEvent event;
-  std::memset(&event, 0, sizeof(event));
-  event.is_final = -1;
-  const int rc = session->engines.asr_push(session->engines.asr_user, pcm, count, sample_rate, &event);
-  if (rc != 0) {
-    session->error = rc == -3 ? "recognizer model files are missing" : "recognizer rejected pcm";
-    return rc;
-  }
-  accept_event(session, event);
+  if (notify && cb != nullptr) cb(cb_user, &cb_event);
   return 0;
-}
-
-/* Caller holds mu. A line that never got its final is kept: it becomes final before the recognizer is reset. */
-static void end_segment_locked(ApexoSession* session) {
-  if (!session->interim.empty()) {
-    const std::string text = session->interim;
-    accept_final(session, text, session->interim_start, session->interim_end);
-  }
-  if (!session->segments.empty()) session->segments.back().closed = true;
-  session->interim.clear();
-  refresh_display(session);
-  if (session->engines.asr_reset != nullptr) {
-    session->engines.asr_reset(session->engines.asr_user);
-    session->reset_calls += 1;
-  }
 }
 
 int apexo_session_end_segment(ApexoSession* session) {
   if (session == nullptr) return -1;
-  std::lock_guard<std::mutex> lock(session->mu);
-  end_segment_locked(session);
+  ApexoTranscriptCallback cb = nullptr;
+  void* cb_user = nullptr;
+  ApexoAsrEvent cb_event;
+  bool notify = false;
+  {
+    std::lock_guard<std::mutex> lock(session->mu);
+    if (session->engines.asr_finish != nullptr) {
+      ApexoAsrEvent event;
+      std::memset(&event, 0, sizeof(event));
+      event.is_final = -1;
+      const int rc = session->engines.asr_finish(session->engines.asr_user, &event);
+      if (rc != 0) {
+        session->error = rc == -3 ? "recognizer model files are missing" : "recognizer failed to finish segment";
+        return rc;
+      }
+      if (event.is_final == 1) {
+        const std::string text(event.text, strnlen(event.text, sizeof(event.text)));
+        if (!text.empty()) {
+          if (accept_final(session, text, event.start_ms, event.end_ms)) {
+            fill_callback_event(&cb_event, text, 1, event.start_ms, event.end_ms);
+            notify = true;
+          }
+        } else {
+          session->interim.clear();
+          session->interim_start = 0;
+          session->interim_end = 0;
+          refresh_display(session);
+        }
+      } else {
+        session->interim.clear();
+        session->interim_start = 0;
+        session->interim_end = 0;
+        refresh_display(session);
+      }
+      if (!session->segments.empty()) session->segments.back().closed = true;
+      session->error.clear();
+    } else {
+      if (!session->interim.empty()) {
+        const std::string text = session->interim;
+        const int32_t s_ms = session->interim_start;
+        const int32_t e_ms = session->interim_end;
+        if (accept_final(session, text, s_ms, e_ms)) {
+          fill_callback_event(&cb_event, text, 1, s_ms, e_ms);
+          notify = true;
+        }
+      }
+      if (!session->segments.empty()) session->segments.back().closed = true;
+      session->interim.clear();
+      refresh_display(session);
+      if (session->engines.asr_reset != nullptr) {
+        session->engines.asr_reset(session->engines.asr_user);
+      }
+      session->error.clear();
+    }
+    cb = session->transcript_cb;
+    cb_user = session->transcript_user;
+  }
+  if (notify && cb != nullptr) cb(cb_user, &cb_event);
   return 0;
 }
 
@@ -443,7 +548,17 @@ void unload_summarizer(ApexoSession* session) {
   session->gemma_resident.store(0);
 }
 
-int generate_chunks(ApexoSession* session, const std::string& text, std::string* out_piece) {
+int generate_one(ApexoSession* session, const std::string& prompt, std::string* out_text) {
+  std::string piece(65536, '\0');
+  const int gen = session->engines.sum_generate(session->engines.sum_user, prompt.c_str(), &piece[0],
+                                                static_cast<int32_t>(piece.size()));
+  if (gen != 0) return gen;
+  *out_text = strip_label(piece.c_str());
+  return 0;
+}
+
+int run_summary_generation(ApexoSession* session, const std::string& text, bool synthesize, std::string* out_piece) {
+  session->gemma_resident.store(1);
   const int load_rc = session->engines.sum_load(session->engines.sum_user, session->model_path.c_str());
   if (load_rc != 0) {
     unload_summarizer(session);  // a half-built engine must not stay in memory
@@ -456,19 +571,75 @@ int generate_chunks(ApexoSession* session, const std::string& text, std::string*
   }
   const std::vector<std::string> work = chunk_text(text, session->summary_chunk_chars);
   out_piece->clear();
-  std::string piece(65536, '\0');
-  for (size_t i = 0; i < work.size(); ++i) {
-    const std::string prompt = std::string(kInstruction) + work[i];
-    piece[0] = '\0';
-    const int gen = session->engines.sum_generate(session->engines.sum_user, prompt.c_str(), &piece[0],
-                                                  static_cast<int32_t>(piece.size()));
+  if (!synthesize) {
+    for (size_t i = 0; i < work.size(); ++i) {
+      std::string piece;
+      const int gen = generate_one(session, std::string(kChunkInstruction) + work[i], &piece);
+      if (gen != 0) {
+        unload_summarizer(session);
+        set_error(session, "gemma generation failed");
+        return gen;
+      }
+      if (!out_piece->empty() && !piece.empty()) out_piece->push_back('\n');
+      out_piece->append(piece);
+    }
+    unload_summarizer(session);
+    return 0;
+  }
+
+  if (work.size() == 1) {
+    const int gen = generate_one(session, std::string(kSynthesizeInstruction) + work[0], out_piece);
     if (gen != 0) {
       unload_summarizer(session);
       set_error(session, "gemma generation failed");
       return gen;
     }
-    if (!out_piece->empty()) out_piece->push_back('\n');
-    out_piece->append(strip_label(piece.c_str()));
+    unload_summarizer(session);
+    return 0;
+  }
+
+  std::string ordered_notes;
+  for (size_t i = 0; i < work.size(); ++i) {
+    std::string note;
+    const int gen = generate_one(session, std::string(kChunkInstruction) + work[i], &note);
+    if (gen != 0) {
+      unload_summarizer(session);
+      set_error(session, "gemma generation failed");
+      return gen;
+    }
+    if (!ordered_notes.empty() && !note.empty()) ordered_notes.push_back('\n');
+    ordered_notes.append(note);
+  }
+
+  while (chunk_text(ordered_notes, session->summary_chunk_chars).size() > 1) {
+    const size_t prev_chars = utf8_char_count(ordered_notes);
+    const std::vector<std::string> groups = chunk_text(ordered_notes, session->summary_chunk_chars);
+    std::string reduced;
+    for (size_t i = 0; i < groups.size(); ++i) {
+      std::string note;
+      const int gen = generate_one(session, std::string(kSynthesizeInstruction) + groups[i], &note);
+      if (gen != 0) {
+        unload_summarizer(session);
+        set_error(session, "gemma generation failed");
+        return gen;
+      }
+      if (!reduced.empty() && !note.empty()) reduced.push_back('\n');
+      reduced.append(note);
+    }
+    const size_t next_chars = utf8_char_count(reduced);
+    if (next_chars >= prev_chars) {
+      unload_summarizer(session);
+      set_error(session, "gemma summary reduction did not converge");
+      return -5;
+    }
+    ordered_notes = reduced;
+  }
+
+  const int final_gen = generate_one(session, std::string(kSynthesizeInstruction) + ordered_notes, out_piece);
+  if (final_gen != 0) {
+    unload_summarizer(session);
+    set_error(session, "gemma generation failed");
+    return final_gen;
   }
   unload_summarizer(session);
   return 0;
@@ -491,7 +662,7 @@ int apexo_session_summarize(ApexoSession* session, char* out, int32_t out_cap) {
   SessionRef ref(session);
   if (session->summarizing.exchange(true)) {
     set_error(session, "a summary is already running");
-    return -5;
+    return APEXO_ERR_BUSY;
   }
   SummarizeGuard guard(session);
   std::string transcript;
@@ -504,29 +675,74 @@ int apexo_session_summarize(ApexoSession* session, char* out, int32_t out_cap) {
       session->error = "summarizer is not attached";
       return -3;
     }
-    if (!session->interim.empty()) {
-      const std::string text = session->interim;
-      accept_final(session, text, session->interim_start, session->interim_end);
-    }
     transcript = session->full;
     start_epoch = session->epoch;
-    session->summary.clear();
-    session->summarized_bytes = 0;
     /* Nothing was said: do not load the model just to have it write a summary of nothing. */
-    if (transcript.empty()) return 0;
-    /* Resident from the start of the load (under mu, so an in-flight push_pcm finishes first). */
-    session->gemma_resident.store(1);
+    if (is_blank_text(transcript)) {
+      session->summary.clear();
+      session->summarized_bytes = 0;
+      session->error.clear();
+      return 0;
+    }
   }
 
-  std::string summary;
-  const int rc = generate_chunks(session, transcript, &summary);
+  std::string generated;
+  const int rc = run_summary_generation(session, transcript, true, &generated);
   if (rc != 0) return rc;
   std::lock_guard<std::mutex> lock(session->mu);
-  if (session->epoch == start_epoch) {
-    session->summary = summary;
-    session->summarized_bytes = transcript.size();
+  if (session->epoch != start_epoch) {
+    session->error.clear();
+    return 0;
   }
-  return copy_out(session, session->summary, out, out_cap);
+  const int copy_rc = copy_out(session, generated, out, out_cap);
+  if (copy_rc != 0) return copy_rc;
+  session->summary = generated;
+  session->summarized_bytes = transcript.size();
+  session->error.clear();
+  return 0;
+}
+
+int apexo_session_summarize_text(ApexoSession* session, const char* text, char* out, int32_t out_cap) {
+  if (session == nullptr || text == nullptr || out == nullptr || out_cap < 1) {
+    if (session != nullptr) set_error(session, "invalid summarize_text arguments");
+    return -1;
+  }
+  out[0] = '\0';
+  const std::string input_copy(text);
+  SessionRef ref(session);
+  if (session->summarizing.exchange(true)) {
+    set_error(session, "a summary is already running");
+    return APEXO_ERR_BUSY;
+  }
+  SummarizeGuard guard(session);
+  uint64_t start_epoch = 0;
+  {
+    std::lock_guard<std::mutex> lock(session->mu);
+    const int path_rc = model_path_ok(session);
+    if (path_rc != 0) return path_rc;
+    if (session->engines.sum_load == nullptr || session->engines.sum_generate == nullptr) {
+      session->error = "summarizer is not attached";
+      return -3;
+    }
+    start_epoch = session->epoch;
+    if (is_blank_text(input_copy)) {
+      session->error.clear();
+      return 0;
+    }
+  }
+
+  std::string generated;
+  const int rc = run_summary_generation(session, input_copy, true, &generated);
+  if (rc != 0) return rc;
+  std::lock_guard<std::mutex> lock(session->mu);
+  if (session->epoch != start_epoch) {
+    session->error.clear();
+    return 0;
+  }
+  const int copy_rc = copy_out(session, generated, out, out_cap);
+  if (copy_rc != 0) return copy_rc;
+  session->error.clear();
+  return 0;
 }
 
 int apexo_session_summarize_new(ApexoSession* session, char* out, int32_t out_cap) {
@@ -535,7 +751,7 @@ int apexo_session_summarize_new(ApexoSession* session, char* out, int32_t out_ca
   SessionRef ref(session);
   if (session->summarizing.exchange(true)) {
     set_error(session, "a summary is already running");
-    return -5;
+    return APEXO_ERR_BUSY;
   }
   SummarizeGuard guard(session);
   std::string delta;
@@ -549,36 +765,46 @@ int apexo_session_summarize_new(ApexoSession* session, char* out, int32_t out_ca
       session->error = "summarizer is not attached";
       return -3;
     }
-    /* Speech still being recognized is included: it is closed as a line here and the recognizer starts over, so
-     * its later results do not write the same words again. */
-    if (!session->interim.empty()) end_segment_locked(session);
     if (session->summarized_bytes >= session->full.size()) {
-      return copy_out(session, session->summary, out, out_cap);
+      const int copy_rc = copy_out(session, session->summary, out, out_cap);
+      if (copy_rc == 0) session->error.clear();
+      return copy_rc;
     }
     size_t start = session->summarized_bytes;
     while (start < session->full.size() && session->full[start] == '\n') ++start;
     delta = session->full.substr(start);
     target_bytes = session->full.size();
     start_epoch = session->epoch;
-    if (delta.empty()) {
-      session->summarized_bytes = target_bytes;
-      return copy_out(session, session->summary, out, out_cap);
+    if (is_blank_text(delta)) {
+      const int copy_rc = copy_out(session, session->summary, out, out_cap);
+      if (copy_rc == 0) {
+        session->summarized_bytes = target_bytes;
+        session->error.clear();
+      }
+      return copy_rc;
     }
   }
 
   std::string piece;
-  const int rc = generate_chunks(session, delta, &piece);
+  const int rc = run_summary_generation(session, delta, false, &piece);
   if (rc != 0) return rc;
   std::lock_guard<std::mutex> lock(session->mu);
-  if (session->epoch == start_epoch && session->full.size() >= target_bytes) {
-    if (!session->summary.empty() && !piece.empty()) session->summary.push_back('\n');
-    session->summary += piece;
-    session->summarized_bytes = target_bytes;
+  if (session->epoch != start_epoch || session->full.size() < target_bytes) {
+    session->error.clear();
+    return 0;
   }
-  return copy_out(session, session->summary, out, out_cap);
+  std::string combined = session->summary;
+  if (!combined.empty() && !piece.empty()) combined.push_back('\n');
+  combined += piece;
+  const int copy_rc = copy_out(session, combined, out, out_cap);
+  if (copy_rc != 0) return copy_rc;
+  session->summary = combined;
+  session->summarized_bytes = target_bytes;
+  session->error.clear();
+  return 0;
 }
 
-void apexo_session_release(ApexoSession* session) {
+void apexo_session_reset(ApexoSession* session) {
   if (session == nullptr) return;
   std::lock_guard<std::mutex> lock(session->mu);
   if (!session->summarizing.load()) {
@@ -591,11 +817,16 @@ void apexo_session_release(ApexoSession* session) {
   session->epoch += 1;
   session->segments.clear();
   session->interim.clear();
+  session->interim_start = 0;
+  session->interim_end = 0;
   session->full.clear();
   session->display.clear();
   session->summary.clear();
   session->summarized_bytes = 0;
+  session->error.clear();
 }
+
+void apexo_session_release(ApexoSession* session) { apexo_session_reset(session); }
 
 const char* apexo_session_last_error(const ApexoSession* session) {
   if (session == nullptr) return "";

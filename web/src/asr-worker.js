@@ -83,9 +83,12 @@ self.onmessage = async (message) => {
     } else if (data.type === "pcm" && pipeline) {
       const event = pipeline.push(data.pcm);
       if (event.isFinal >= 0) self.postMessage({ type: "event", gen: data.gen, event });
-    } else if (data.type === "end" && pipeline) {
-      pipeline.reset();
-      self.postMessage({ type: "end", gen: data.gen });
+    } else if (data.type === "end") {
+      if (pipeline) {
+        const event = pipeline.finish();
+        if (event.isFinal >= 0) self.postMessage({ type: "event", gen: data.gen, event });
+      }
+      self.postMessage({ type: "end", gen: data.gen, id: data.id });
     } else if (data.type === "reset" && pipeline) {
       pipeline.reset();
     } else if (data.type === "sync") {

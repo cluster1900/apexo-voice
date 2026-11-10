@@ -12,152 +12,38 @@
 #include <sys/stat.h>
 #endif
 
-#if defined(APEXO_STATIC_ENGINES)
-/* Static mode (compile with -DAPEXO_STATIC_ENGINES): the engines are linked into the host program instead of being
- * found with dlopen. The host must link both the sherpa-onnx C API and the LiteRT-LM C API (1.0.0 or newer). */
-#define APEXO_WEAK
-extern "C" {
-APEXO_WEAK const void* SherpaOnnxCreateOnlineRecognizer(const void* config);
-APEXO_WEAK void SherpaOnnxDestroyOnlineRecognizer(const void* recognizer);
-APEXO_WEAK const void* SherpaOnnxCreateOnlineStream(const void* recognizer);
-APEXO_WEAK void SherpaOnnxDestroyOnlineStream(const void* stream);
-APEXO_WEAK void SherpaOnnxOnlineStreamAcceptWaveform(const void* stream, int32_t sample_rate, const float* samples, int32_t n);
-APEXO_WEAK int32_t SherpaOnnxIsOnlineStreamReady(const void* recognizer, const void* stream);
-APEXO_WEAK void SherpaOnnxDecodeOnlineStream(const void* recognizer, const void* stream);
-APEXO_WEAK const void* SherpaOnnxGetOnlineStreamResult(const void* recognizer, const void* stream);
-APEXO_WEAK void SherpaOnnxDestroyOnlineRecognizerResult(const void* result);
-APEXO_WEAK int32_t SherpaOnnxOnlineStreamIsEndpoint(const void* recognizer, const void* stream);
-APEXO_WEAK void SherpaOnnxOnlineStreamReset(const void* recognizer, const void* stream);
-
-APEXO_WEAK int litert_lm_engine_settings_create(const char* model, const char* backend, const char* vision, const char* audio, void** out);
-APEXO_WEAK void litert_lm_engine_settings_delete(void* settings);
-APEXO_WEAK int litert_lm_engine_create(const void* settings, void** out);
-APEXO_WEAK void litert_lm_engine_delete(void* engine);
-APEXO_WEAK int litert_lm_conversation_create(void* engine, void* config, void** out);
-APEXO_WEAK void litert_lm_conversation_delete(void* conversation);
-APEXO_WEAK int litert_lm_conversation_send_message(void* conversation, const char* message, const char* extra, const void* optional_args, void** out);
-APEXO_WEAK void litert_lm_json_response_delete(void* response);
-APEXO_WEAK int litert_lm_json_response_get_string(const void* response, const char** out);
-}
-#endif
+#define LITERT_LM_C_API_EXPORT
+#include "third_party/litert-lm/conversation.h"
+#include "third_party/sherpa-onnx/c-api.h"
 
 namespace {
 
-struct SherpaOnlineTransducer {
-  const char* encoder;
-  const char* decoder;
-  const char* joiner;
-};
+/* Streaming Zipformer right-context tail padding (0.3 s at 16 kHz), matching sherpa-onnx C API streaming
+ * transducer examples. Fed only inside asr_finish and never added to the user audio timeline. */
+constexpr int32_t kAsrFinishTailSamples = 4800;
 
-struct SherpaOnlineParaformer {
-  const char* encoder;
-  const char* decoder;
-};
+using CreateOnlineRecognizerFn = decltype(&SherpaOnnxCreateOnlineRecognizer);
+using DestroyOnlineRecognizerFn = decltype(&SherpaOnnxDestroyOnlineRecognizer);
+using CreateOnlineStreamFn = decltype(&SherpaOnnxCreateOnlineStream);
+using DestroyOnlineStreamFn = decltype(&SherpaOnnxDestroyOnlineStream);
+using AcceptWaveformFn = decltype(&SherpaOnnxOnlineStreamAcceptWaveform);
+using IsReadyFn = decltype(&SherpaOnnxIsOnlineStreamReady);
+using DecodeFn = decltype(&SherpaOnnxDecodeOnlineStream);
+using GetResultFn = decltype(&SherpaOnnxGetOnlineStreamResult);
+using DestroyResultFn = decltype(&SherpaOnnxDestroyOnlineRecognizerResult);
+using IsEndpointFn = decltype(&SherpaOnnxOnlineStreamIsEndpoint);
+using ResetStreamFn = decltype(&SherpaOnnxOnlineStreamReset);
+using InputFinishedFn = decltype(&SherpaOnnxOnlineStreamInputFinished);
 
-struct SherpaOnlineZipformer2Ctc {
-  const char* model;
-};
-
-struct SherpaOnlineNemoCtc {
-  const char* model;
-};
-
-struct SherpaOnlineToneCtc {
-  const char* model;
-};
-
-struct SherpaOnlineModelConfig {
-  SherpaOnlineTransducer transducer;
-  SherpaOnlineParaformer paraformer;
-  SherpaOnlineZipformer2Ctc zipformer2_ctc;
-  const char* tokens;
-  int32_t num_threads;
-  const char* provider;
-  int32_t debug;
-  const char* model_type;
-  const char* modeling_unit;
-  const char* bpe_vocab;
-  const char* tokens_buf;
-  int32_t tokens_buf_size;
-  SherpaOnlineNemoCtc nemo_ctc;
-  SherpaOnlineToneCtc t_one_ctc;
-};
-
-struct SherpaFeatureConfig {
-  int32_t sample_rate;
-  int32_t feature_dim;
-};
-
-struct SherpaOnlineCtcFstDecoderConfig {
-  const char* graph;
-  int32_t max_active;
-};
-
-struct SherpaHomophoneReplacerConfig {
-  const char* dict_dir;
-  const char* lexicon;
-  const char* rule_fsts;
-};
-
-/* Layout matches sherpa-onnx v2.0.1 SherpaOnnxOnlineRecognizerConfig. */
-struct SherpaOnlineRecognizerConfig {
-  SherpaFeatureConfig feat_config;
-  SherpaOnlineModelConfig model_config;
-  const char* decoding_method;
-  int32_t max_active_paths;
-  int32_t enable_endpoint;
-  float rule1_min_trailing_silence;
-  float rule2_min_trailing_silence;
-  float rule3_min_utterance_length;
-  const char* hotwords_file;
-  float hotwords_score;
-  SherpaOnlineCtcFstDecoderConfig ctc_fst_decoder_config;
-  const char* rule_fsts;
-  const char* rule_fars;
-  float blank_penalty;
-  const char* hotwords_buf;
-  int32_t hotwords_buf_size;
-  SherpaHomophoneReplacerConfig hr;
-};
-
-struct SherpaOnlineRecognizerResult {
-  const char* text;
-  const char* tokens;
-  const char* const* tokens_arr;
-  float* timestamps;
-  int32_t count;
-  const char* json;
-};
-
-struct SherpaOnlineRecognizer;
-struct SherpaOnlineStream;
-
-using CreateOnlineRecognizerFn = const SherpaOnlineRecognizer* (*)(const SherpaOnlineRecognizerConfig*);
-using DestroyOnlineRecognizerFn = void (*)(const SherpaOnlineRecognizer*);
-using CreateOnlineStreamFn = const SherpaOnlineStream* (*)(const SherpaOnlineRecognizer*);
-using DestroyOnlineStreamFn = void (*)(const SherpaOnlineStream*);
-using AcceptWaveformFn = void (*)(const SherpaOnlineStream*, int32_t, const float*, int32_t);
-using IsReadyFn = int32_t (*)(const SherpaOnlineRecognizer*, const SherpaOnlineStream*);
-using DecodeFn = void (*)(const SherpaOnlineRecognizer*, const SherpaOnlineStream*);
-using GetResultFn = const SherpaOnlineRecognizerResult* (*)(const SherpaOnlineRecognizer*, const SherpaOnlineStream*);
-using DestroyResultFn = void (*)(const SherpaOnlineRecognizerResult*);
-using IsEndpointFn = int32_t (*)(const SherpaOnlineRecognizer*, const SherpaOnlineStream*);
-using ResetStreamFn = void (*)(const SherpaOnlineRecognizer*, const SherpaOnlineStream*);
-
-struct LiteRtSettings;
-struct LiteRtEngine;
-struct LiteRtConversation;
-struct LiteRtJsonResponse;
-
-using SettingsCreateFn = int (*)(const char*, const char*, const char*, const char*, LiteRtSettings**);
-using SettingsDeleteFn = void (*)(LiteRtSettings*);
-using EngineCreateFn = int (*)(const LiteRtSettings*, LiteRtEngine**);
-using EngineDeleteFn = void (*)(LiteRtEngine*);
-using ConversationCreateFn = int (*)(LiteRtEngine*, void*, LiteRtConversation**);
-using ConversationDeleteFn = void (*)(LiteRtConversation*);
-using SendMessageFn = int (*)(LiteRtConversation*, const char*, const char*, const void*, LiteRtJsonResponse**);
-using JsonDeleteFn = void (*)(LiteRtJsonResponse*);
-using JsonGetFn = int (*)(const LiteRtJsonResponse*, const char**);
+using SettingsCreateFn = decltype(&litert_lm_engine_settings_create);
+using SettingsDeleteFn = decltype(&litert_lm_engine_settings_delete);
+using EngineCreateFn = decltype(&litert_lm_engine_create);
+using EngineDeleteFn = decltype(&litert_lm_engine_delete);
+using ConversationCreateFn = decltype(&litert_lm_conversation_create);
+using ConversationDeleteFn = decltype(&litert_lm_conversation_delete);
+using SendMessageFn = decltype(&litert_lm_conversation_send_message);
+using JsonDeleteFn = decltype(&litert_lm_json_response_delete);
+using JsonGetFn = decltype(&litert_lm_json_response_get_string);
 
 struct SherpaApi {
   void* library = nullptr;
@@ -174,6 +60,7 @@ struct SherpaApi {
   DestroyResultFn destroy_result = nullptr;
   IsEndpointFn is_endpoint = nullptr;
   ResetStreamFn reset_stream = nullptr;
+  InputFinishedFn input_finished = nullptr;
 };
 
 struct LitertApi {
@@ -204,14 +91,15 @@ struct EngineState {
   int64_t samples = 0;
   AsrMode asr_mode = AsrMode::kUnknown;
   SherpaApi sherpa;
-  const SherpaOnlineRecognizer* recognizer = nullptr;
-  const SherpaOnlineStream* stream = nullptr;
+  const SherpaOnnxOnlineRecognizer* recognizer = nullptr;
+  const SherpaOnnxOnlineStream* stream = nullptr;
   LitertApi litert;
-  LiteRtSettings* settings = nullptr;
-  LiteRtEngine* engine = nullptr;
-  LiteRtConversation* conversation = nullptr;
-  int generated = 0;      // messages sent on the current conversation
+  LiteRtLmEngineSettings* settings = nullptr;
+  LiteRtLmEngine* engine = nullptr;
+  LiteRtLmConversation* conversation = nullptr;
+  int generated = 0;                // messages sent on the current conversation
   int64_t utterance_start_ms = -1;  // start of the words being decoded, -1 when none
+  bool stream_has_audio = false;    // whether the current stream has received audio since last reset/finish
 };
 
 #if defined(_WIN32)
@@ -229,6 +117,24 @@ std::wstring utf8_to_wide(const std::string& path) {
   std::wstring out(static_cast<size_t>(needed - 1), L'\0');
   MultiByteToWideChar(cp, flags, path.c_str(), -1, &out[0], needed);
   return out;
+}
+
+/* Converts a wide path to UTF-8. Used for engines (such as sherpa-onnx v2.0.1 on Windows) that decode
+ * narrow paths as UTF-8 -> wide strings internally. */
+bool wide_to_utf8(const std::wstring& wide, std::string* out) {
+  if (wide.empty()) return false;
+  const int needed = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, nullptr, 0, nullptr, nullptr);
+  if (needed <= 0) return false;
+  std::string converted(static_cast<size_t>(needed - 1), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, &converted[0], needed, nullptr, nullptr);
+  *out = converted;
+  return true;
+}
+
+bool normalize_utf8_path(const std::string& path, std::string* out) {
+  const std::wstring wpath = utf8_to_wide(path);
+  if (wpath.empty()) return false;
+  return wide_to_utf8(wpath, out);
 }
 
 /* Converts a wide path to the ANSI code page. Fails instead of substituting characters that code page cannot
@@ -267,18 +173,54 @@ bool normalize_narrow_path(const std::string& path, std::string* out) {
 #endif
 
 #if !defined(APEXO_STATIC_ENGINES)
+#if defined(_WIN32)
+std::wstring self_module_dir() {
+  HMODULE self = nullptr;
+  if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                          reinterpret_cast<LPCWSTR>(&self_module_dir), &self) ||
+      self == nullptr) {
+    return {};
+  }
+  std::wstring buf(4096, L'\0');
+  const DWORD len = GetModuleFileNameW(self, &buf[0], static_cast<DWORD>(buf.size()));
+  if (len == 0 || len >= buf.size()) return {};
+  buf.resize(len);
+  const size_t sep = buf.find_last_of(L"\\/");
+  return sep == std::wstring::npos ? std::wstring() : buf.substr(0, sep);
+}
+
+void* load_win32_full_path(const std::wstring& path_with_sep) {
+  const DWORD needed = GetFullPathNameW(path_with_sep.c_str(), 0, nullptr, nullptr);
+  if (needed == 0) return reinterpret_cast<void*>(LoadLibraryW(path_with_sep.c_str()));
+  std::wstring full(needed, L'\0');
+  const DWORD written = GetFullPathNameW(path_with_sep.c_str(), needed, &full[0], nullptr);
+  if (written == 0 || written >= needed) return reinterpret_cast<void*>(LoadLibraryW(path_with_sep.c_str()));
+  full.resize(written);
+  HMODULE mod =
+      LoadLibraryExW(full.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+  if (mod != nullptr) return reinterpret_cast<void*>(mod);
+  return reinterpret_cast<void*>(LoadLibraryExW(full.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH));
+}
+#endif
+
 void* open_library(const char* path) {
   if (path == nullptr || path[0] == '\0') return nullptr;
 #if defined(_WIN32)
-  const std::wstring wpath = utf8_to_wide(path);
+  std::wstring wpath = utf8_to_wide(path);
   if (wpath.empty()) return nullptr;
-  if (wpath.find_first_of(L"/\\") != std::wstring::npos) {
-    wchar_t full_buf[4096];
-    const DWORD len = GetFullPathNameW(wpath.c_str(), 4096, full_buf, nullptr);
-    const wchar_t* target = (len > 0 && len < 4096) ? full_buf : wpath.c_str();
-    HMODULE mod =
-        LoadLibraryExW(target, nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-    if (mod != nullptr) return reinterpret_cast<void*>(mod);
+  for (wchar_t& ch : wpath) {
+    if (ch == L'/') ch = L'\\';
+  }
+  if (wpath.find_first_of(L"\\:") != std::wstring::npos) {
+    return load_win32_full_path(wpath);
+  }
+  const std::wstring self_dir = self_module_dir();
+  if (!self_dir.empty()) {
+    const std::wstring sibling = self_dir + L"\\" + wpath;
+    if (GetFileAttributesW(sibling.c_str()) != INVALID_FILE_ATTRIBUTES) {
+      void* mod = load_win32_full_path(sibling);
+      if (mod != nullptr) return mod;
+    }
   }
   return reinterpret_cast<void*>(LoadLibraryW(wpath.c_str()));
 #else
@@ -329,13 +271,15 @@ std::string join_path(const std::string& dir, const char* name) {
 
 #if !defined(APEXO_STATIC_ENGINES)
 void* open_first_available(const std::string& explicit_path, const char* env_key, const char* primary,
-                           const char* secondary) {
+                           const char* secondary, const char* tertiary = nullptr) {
   if (!explicit_path.empty()) return open_library(explicit_path.c_str());
   const char* env_val = std::getenv(env_key);
   if (env_val != nullptr && env_val[0] != '\0') return open_library(env_val);
   void* lib = open_library(primary);
   if (lib != nullptr) return lib;
-  return open_library(secondary);
+  lib = open_library(secondary);
+  if (lib != nullptr || tertiary == nullptr) return lib;
+  return open_library(tertiary);
 }
 
 void* open_default_sherpa(const std::string& explicit_path) {
@@ -343,7 +287,7 @@ void* open_default_sherpa(const std::string& explicit_path) {
   return open_first_available(explicit_path, "APEXO_SHERPA_LIBRARY", "sherpa-onnx-c-api.dll", "sherpa-onnx.dll");
 #elif defined(__APPLE__)
   return open_first_available(explicit_path, "APEXO_SHERPA_LIBRARY", "libsherpa-onnx-c-api.dylib",
-                              "libsherpa-onnx.dylib");
+                              "libsherpa-onnx.dylib", "@rpath/SherpaOnnxC.framework/SherpaOnnxC");
 #else
   return open_first_available(explicit_path, "APEXO_SHERPA_LIBRARY", "libsherpa-onnx-c-api.so", "libsherpa-onnx.so");
 #endif
@@ -353,7 +297,8 @@ void* open_default_litert(const std::string& explicit_path) {
 #if defined(_WIN32)
   return open_first_available(explicit_path, "APEXO_LITERT_LIBRARY", "litert-lm.dll", "litert_lm.dll");
 #elif defined(__APPLE__)
-  return open_first_available(explicit_path, "APEXO_LITERT_LIBRARY", "liblitert-lm.dylib", "liblitert_lm.dylib");
+  return open_first_available(explicit_path, "APEXO_LITERT_LIBRARY", "liblitert-lm.dylib", "liblitert_lm.dylib",
+                              "@rpath/CLiteRTLM.framework/CLiteRTLM");
 #else
   return open_first_available(explicit_path, "APEXO_LITERT_LIBRARY", "liblitert-lm.so", "liblitert_lm.so");
 #endif
@@ -387,9 +332,10 @@ bool load_sherpa(SherpaApi* api, const std::string& explicit_path) {
   APEXO_BIND(api, destroy_result, DestroyResultFn, SherpaOnnxDestroyOnlineRecognizerResult);
   APEXO_BIND(api, is_endpoint, IsEndpointFn, SherpaOnnxOnlineStreamIsEndpoint);
   APEXO_BIND(api, reset_stream, ResetStreamFn, SherpaOnnxOnlineStreamReset);
+  APEXO_BIND(api, input_finished, InputFinishedFn, SherpaOnnxOnlineStreamInputFinished);
   api->ready = api->create_recognizer && api->destroy_recognizer && api->create_stream && api->destroy_stream &&
                api->accept_waveform && api->is_ready && api->decode && api->get_result && api->destroy_result &&
-               api->is_endpoint && api->reset_stream;
+               api->is_endpoint && api->reset_stream && api->input_finished;
   return api->ready;
 }
 
@@ -463,21 +409,23 @@ int ensure_asr(EngineState* state) {
     state->asr_mode = AsrMode::kFailed;
     return -5;
   }
-  SherpaOnlineRecognizerConfig config;
+  SherpaOnnxOnlineRecognizerConfig config;
   std::memset(&config, 0, sizeof(config));
   config.feat_config.sample_rate = APEXO_SAMPLE_RATE;
   config.feat_config.feature_dim = 80;
 #if defined(_WIN32)
-  std::string tokens, encoder, decoder, joiner;
-  if (!normalize_narrow_path(state->tokens_path, &tokens) || !normalize_narrow_path(state->encoder_path, &encoder) ||
-      !normalize_narrow_path(state->decoder_path, &decoder) || !normalize_narrow_path(state->joiner_path, &joiner)) {
+  std::string tokens_utf8, encoder_utf8, decoder_utf8, joiner_utf8;
+  if (!normalize_utf8_path(state->tokens_path, &tokens_utf8) ||
+      !normalize_utf8_path(state->encoder_path, &encoder_utf8) ||
+      !normalize_utf8_path(state->decoder_path, &decoder_utf8) ||
+      !normalize_utf8_path(state->joiner_path, &joiner_utf8)) {
     state->asr_mode = AsrMode::kFailed;
     return -5;
   }
-  config.model_config.tokens = tokens.c_str();
-  config.model_config.transducer.encoder = encoder.c_str();
-  config.model_config.transducer.decoder = decoder.c_str();
-  config.model_config.transducer.joiner = joiner.c_str();
+  config.model_config.tokens = tokens_utf8.c_str();
+  config.model_config.transducer.encoder = encoder_utf8.c_str();
+  config.model_config.transducer.decoder = decoder_utf8.c_str();
+  config.model_config.transducer.joiner = joiner_utf8.c_str();
 #else
   config.model_config.tokens = state->tokens_path.c_str();
   config.model_config.transducer.encoder = state->encoder_path.c_str();
@@ -489,6 +437,23 @@ int ensure_asr(EngineState* state) {
   config.decoding_method = "greedy_search";
   config.enable_endpoint = 1;
   state->recognizer = state->sherpa.create_recognizer(&config);
+#if defined(_WIN32)
+  if (state->recognizer == nullptr) {
+    std::string tokens_acp, encoder_acp, decoder_acp, joiner_acp;
+    if (normalize_narrow_path(state->tokens_path, &tokens_acp) &&
+        normalize_narrow_path(state->encoder_path, &encoder_acp) &&
+        normalize_narrow_path(state->decoder_path, &decoder_acp) &&
+        normalize_narrow_path(state->joiner_path, &joiner_acp) &&
+        (tokens_acp != tokens_utf8 || encoder_acp != encoder_utf8 || decoder_acp != decoder_utf8 ||
+         joiner_acp != joiner_utf8)) {
+      config.model_config.tokens = tokens_acp.c_str();
+      config.model_config.transducer.encoder = encoder_acp.c_str();
+      config.model_config.transducer.decoder = decoder_acp.c_str();
+      config.model_config.transducer.joiner = joiner_acp.c_str();
+      state->recognizer = state->sherpa.create_recognizer(&config);
+    }
+  }
+#endif
   if (state->recognizer == nullptr) {
     state->asr_mode = AsrMode::kFailed;
     return -5;
@@ -498,6 +463,7 @@ int ensure_asr(EngineState* state) {
     state->asr_mode = AsrMode::kFailed;
     return -5;
   }
+  state->stream_has_audio = false;
   state->asr_mode = AsrMode::kLive;
   return 0;
 }
@@ -512,6 +478,7 @@ int asr_push(void* user, const float* pcm, int32_t count, int32_t sample_rate, A
   if (ready != 0) return ready;
   const int64_t chunk_start_ms = state->samples * 1000 / APEXO_SAMPLE_RATE;
   state->sherpa.accept_waveform(state->stream, sample_rate, pcm, count);
+  if (count > 0) state->stream_has_audio = true;
   state->samples += count;
   const int64_t chunk_end_ms = state->samples * 1000 / APEXO_SAMPLE_RATE;
   /* Decode everything that is ready, so latency does not pile up behind large pushes. The bound only guards
@@ -519,7 +486,7 @@ int asr_push(void* user, const float* pcm, int32_t count, int32_t sample_rate, A
   for (int steps = 0; steps < 1024 && state->sherpa.is_ready(state->recognizer, state->stream); ++steps) {
     state->sherpa.decode(state->recognizer, state->stream);
   }
-  const SherpaOnlineRecognizerResult* result = state->sherpa.get_result(state->recognizer, state->stream);
+  const SherpaOnnxOnlineRecognizerResult* result = state->sherpa.get_result(state->recognizer, state->stream);
   copy_text(out, result != nullptr ? result->text : "");
   const int endpoint = state->sherpa.is_endpoint(state->recognizer, state->stream);
   if (result != nullptr) state->sherpa.destroy_result(result);
@@ -533,17 +500,55 @@ int asr_push(void* user, const float* pcm, int32_t count, int32_t sample_rate, A
     out->is_final = has_text ? 1 : -1;
     state->sherpa.reset_stream(state->recognizer, state->stream);
     state->utterance_start_ms = -1;
+    state->stream_has_audio = false;
   } else {
     out->is_final = has_text ? 0 : -1;
   }
   return 0;
 }
 
+int asr_finish(void* user, ApexoAsrEvent* out) {
+  EngineState* state = static_cast<EngineState*>(user);
+  if (state == nullptr || out == nullptr) return -1;
+  std::memset(out, 0, sizeof(*out));
+  out->is_final = -1;
+  if (state->asr_mode != AsrMode::kLive || state->recognizer == nullptr || state->stream == nullptr ||
+      !state->stream_has_audio) {
+    return 0;
+  }
+  static const float kTailPadding[kAsrFinishTailSamples] = {0.0f};
+  state->sherpa.accept_waveform(state->stream, APEXO_SAMPLE_RATE, kTailPadding, kAsrFinishTailSamples);
+  state->sherpa.input_finished(state->stream);
+  for (int steps = 0; steps < 1024 && state->sherpa.is_ready(state->recognizer, state->stream); ++steps) {
+    state->sherpa.decode(state->recognizer, state->stream);
+  }
+  const SherpaOnnxOnlineRecognizerResult* result = state->sherpa.get_result(state->recognizer, state->stream);
+  copy_text(out, result != nullptr ? result->text : "");
+  if (result != nullptr) state->sherpa.destroy_result(result);
+  const int64_t end_ms = state->samples * 1000 / APEXO_SAMPLE_RATE;
+  const bool has_text = out->text[0] != '\0';
+  out->start_ms = static_cast<int32_t>(has_text && state->utterance_start_ms >= 0 ? state->utterance_start_ms : end_ms);
+  out->end_ms = static_cast<int32_t>(end_ms);
+  out->is_final = has_text ? 1 : -1;
+  state->sherpa.destroy_stream(state->stream);
+  state->stream = state->sherpa.create_stream(state->recognizer);
+  state->utterance_start_ms = -1;
+  state->stream_has_audio = false;
+  if (state->stream == nullptr) {
+    state->asr_mode = AsrMode::kFailed;
+    return -5;
+  }
+  return 0;
+}
+
 void asr_reset(void* user) {
   EngineState* state = static_cast<EngineState*>(user);
-  if (state == nullptr || state->asr_mode != AsrMode::kLive || state->recognizer == nullptr || state->stream == nullptr) return;
-  state->sherpa.reset_stream(state->recognizer, state->stream);
+  if (state == nullptr) return;
+  state->samples = 0;
   state->utterance_start_ms = -1;
+  state->stream_has_audio = false;
+  if (state->asr_mode != AsrMode::kLive || state->recognizer == nullptr || state->stream == nullptr) return;
+  state->sherpa.reset_stream(state->recognizer, state->stream);
 }
 
 int sum_is_loaded(void* user) {
@@ -556,7 +561,7 @@ int new_conversation(EngineState* state) {
   if (state->conversation != nullptr) state->litert.conversation_delete(state->conversation);
   state->conversation = nullptr;
   state->generated = 0;
-  LiteRtConversation* conversation = nullptr;
+  LiteRtLmConversation* conversation = nullptr;
   if (state->litert.conversation_create(state->engine, nullptr, &conversation) != 0 || conversation == nullptr) return -5;
   state->conversation = conversation;
   return 0;
@@ -574,21 +579,44 @@ int sum_load(void* user, const char* model_path) {
     return -5;
   };
   if (!load_litert(&state->litert, state->litert_library)) return fail();
-  LiteRtSettings* settings = nullptr;
+  LiteRtLmEngineSettings* settings = nullptr;
+  LiteRtLmEngine* engine = nullptr;
 #if defined(_WIN32)
-  std::string normalized_path;
-  if (!normalize_narrow_path(path, &normalized_path)) return fail();
-  const char* settings_path = normalized_path.c_str();
+  std::string utf8_path;
+  std::string acp_path;
+  const bool have_utf8 = normalize_utf8_path(path, &utf8_path);
+  const bool have_acp = normalize_narrow_path(path, &acp_path);
+  if (!have_utf8 && !have_acp) return fail();
+  auto try_create_litert = [&](const std::string& candidate) -> bool {
+    settings = nullptr;
+    engine = nullptr;
+    if (state->litert.settings_create(candidate.c_str(), "cpu", nullptr, nullptr, &settings) != 0 ||
+        settings == nullptr) {
+      return false;
+    }
+    if (state->litert.engine_create(settings, &engine) != 0 || engine == nullptr) {
+      state->litert.settings_delete(settings);
+      settings = nullptr;
+      return false;
+    }
+    return true;
+  };
+  bool created = false;
+  if (have_utf8) created = try_create_litert(utf8_path);
+  if (!created && have_acp && (!have_utf8 || acp_path != utf8_path)) {
+    created = try_create_litert(acp_path);
+  }
+  if (!created) return fail();
+  state->settings = settings;
+  state->engine = engine;
 #else
-  const char* settings_path = path;
-#endif
-  if (state->litert.settings_create(settings_path, "cpu", nullptr, nullptr, &settings) != 0 || settings == nullptr) {
+  if (state->litert.settings_create(path, "cpu", nullptr, nullptr, &settings) != 0 || settings == nullptr) {
     return fail();
   }
   state->settings = settings;
-  LiteRtEngine* engine = nullptr;
   if (state->litert.engine_create(settings, &engine) != 0 || engine == nullptr) return fail();
   state->engine = engine;
+#endif
   if (new_conversation(state) != 0) return fail();
   return 0;
 }
@@ -744,7 +772,7 @@ int sum_generate(void* user, const char* prompt, char* out, int32_t out_cap) {
   if (state->generated > 0 && new_conversation(state) != 0) return -5;
   if (state->conversation == nullptr) return -5;
   const std::string json = message_json(prompt);
-  LiteRtJsonResponse* response = nullptr;
+  LiteRtLmJsonResponse* response = nullptr;
   if (state->litert.send_message(state->conversation, json.c_str(), nullptr, nullptr, &response) != 0 || response == nullptr) {
     return -5;
   }
@@ -805,5 +833,6 @@ extern "C" int apexo_engine_state_bind(void* user, ApexoEngines* out) {
   out->sum_load = sum_load;
   out->sum_unload = sum_unload;
   out->sum_generate = sum_generate;
+  out->asr_finish = asr_finish;
   return 0;
 }

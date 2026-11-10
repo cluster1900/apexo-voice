@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { Readable } from "node:stream";
-import { readFile } from "node:fs/promises";
+import { createReadStream, existsSync, statSync } from "node:fs";
 import { extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -14,6 +14,10 @@ const types = {
   ".js": "text/javascript; charset=utf-8",
   ".wasm": "application/wasm",
   ".map": "application/json",
+  ".json": "application/json",
+  ".wav": "audio/wav",
+  ".onnx": "application/octet-stream",
+  ".litertlm": "application/octet-stream",
 };
 
 function inside(base, relativePath) {
@@ -30,6 +34,21 @@ const sharedHeaders = {
 };
 
 async function sendGemmaDownload(response) {
+  const localFile = join(root, gemmaWebFile);
+  if (existsSync(localFile) && statSync(localFile).isFile()) {
+    const size = statSync(localFile).size;
+    response.writeHead(200, {
+      ...sharedHeaders,
+      "Content-Type": "application/octet-stream",
+      "Content-Disposition": `attachment; filename="${gemmaWebFile}"`,
+      "Content-Length": size,
+    });
+    const stream = createReadStream(localFile);
+    stream.on("error", () => response.destroy());
+    response.on("close", () => stream.destroy());
+    stream.pipe(response);
+    return;
+  }
   const upstream = await fetch(gemmaWebUrl);
   if (!upstream.ok || !upstream.body) {
     response.writeHead(upstream.status || 502, sharedHeaders);
@@ -65,7 +84,19 @@ const server = createServer(async (request, response) => {
     return;
   }
   let file = join(root, "index.html");
-  if (url.pathname.startsWith("/vendor/")) {
+  if (url.pathname.startsWith("/assets/apexo/sherpa/")) {
+    const rel = decodeURIComponent(url.pathname.slice("/assets/apexo/sherpa/".length));
+    file = inside(join(vendorRoot, "sherpa-onnx"), rel);
+  } else if (url.pathname.startsWith("/assets/apexo/litert/dist/")) {
+    const rel = decodeURIComponent(url.pathname.slice("/assets/apexo/litert/dist/".length));
+    file = inside(join(vendorRoot, "@litert-lm/core/dist"), rel);
+  } else if (url.pathname.startsWith("/assets/apexo/litert/")) {
+    const rel = decodeURIComponent(url.pathname.slice("/assets/apexo/litert/".length));
+    file = inside(join(vendorRoot, "@litert-lm/core/wasm"), rel);
+  } else if (url.pathname.startsWith("/assets/apexo/wasm-utils/dist/")) {
+    const rel = decodeURIComponent(url.pathname.slice("/assets/apexo/wasm-utils/dist/".length));
+    file = inside(join(vendorRoot, "@litertjs/wasm-utils/dist"), rel);
+  } else if (url.pathname.startsWith("/vendor/")) {
     let vendorPath;
     try {
       vendorPath = decodeURIComponent(url.pathname.slice("/vendor/".length));
@@ -75,24 +106,77 @@ const server = createServer(async (request, response) => {
       return;
     }
     file = inside(vendorRoot, vendorPath);
+  } else if (url.pathname.startsWith("/sdk/")) {
+    file = inside(sdkRoot, url.pathname.slice("/sdk/".length));
+  } else if (url.pathname === "/worklet.js") {
+    file = join(root, "worklet.js");
+  } else if (url.pathname !== "/") {
+    file = inside(root, url.pathname.slice(1));
   }
-  else if (url.pathname.startsWith("/sdk/")) file = inside(sdkRoot, url.pathname.slice("/sdk/".length));
-  else if (url.pathname === "/worklet.js") file = join(root, "worklet.js");
-  else if (url.pathname !== "/") file = inside(root, url.pathname.slice(1));
-  if (!file) {
-    response.writeHead(404);
+
+  if (!file || !existsSync(file)) {
+    response.writeHead(404, sharedHeaders);
     response.end("not found");
     return;
   }
-  const headers = sharedHeaders;
+
+  let stats;
   try {
-    const body = await readFile(file);
-    response.writeHead(200, { ...headers, "Content-Type": types[extname(file)] || "application/octet-stream" });
-    response.end(request.method === "HEAD" ? undefined : body);
+    stats = statSync(file);
+    if (stats.isDirectory()) {
+      response.writeHead(404, sharedHeaders);
+      response.end("not found");
+      return;
+    }
   } catch {
-    const probe = request.headers["x-apexo-probe"] === "1";
-    response.writeHead(probe ? 204 : 404, headers);
-    response.end(probe ? undefined : "not found");
+    response.writeHead(404, sharedHeaders);
+    response.end("not found");
+    return;
+  }
+
+  const size = stats.size;
+  const mime = types[extname(file)] || "application/octet-stream";
+  const rangeHeader = request.headers.range;
+  const rangeMatch = rangeHeader ? rangeHeader.match(/^bytes=(\d+)-(\d*)$/) : null;
+
+  if (rangeMatch) {
+    const start = Number(rangeMatch[1]);
+    const end = rangeMatch[2] ? Math.min(size - 1, Number(rangeMatch[2])) : size - 1;
+    if (start >= size || end < start) {
+      response.writeHead(416, { ...sharedHeaders, "Content-Range": `bytes */${size}` });
+      response.end();
+      return;
+    }
+    response.writeHead(206, {
+      ...sharedHeaders,
+      "Content-Type": mime,
+      "Content-Length": end - start + 1,
+      "Content-Range": `bytes ${start}-${end}/${size}`,
+      "Accept-Ranges": "bytes",
+    });
+    if (request.method === "HEAD") {
+      response.end();
+    } else {
+      const stream = createReadStream(file, { start, end });
+      stream.on("error", () => response.destroy());
+      response.on("close", () => stream.destroy());
+      stream.pipe(response);
+    }
+  } else {
+    response.writeHead(200, {
+      ...sharedHeaders,
+      "Content-Type": mime,
+      "Content-Length": size,
+      "Accept-Ranges": "bytes",
+    });
+    if (request.method === "HEAD") {
+      response.end();
+    } else {
+      const stream = createReadStream(file);
+      stream.on("error", () => response.destroy());
+      response.on("close", () => stream.destroy());
+      stream.pipe(response);
+    }
   }
 });
 

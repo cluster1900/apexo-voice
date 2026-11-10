@@ -8,15 +8,36 @@
 
 /* Begin PBXBuildFile section */
 		B10000000000000000000001 /* ApexoSession.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = F10000000000000000000001 /* ApexoSession.xcframework */; };
+		B10000000000000000000002 /* SherpaOnnxC.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = F10000000000000000000002 /* SherpaOnnxC.xcframework */; };
+		B10000000000000000000003 /* CLiteRTLM.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = F10000000000000000000003 /* CLiteRTLM.xcframework */; };
+		B10000000000000000000004 /* SherpaOnnxC.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = F10000000000000000000002 /* SherpaOnnxC.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		B10000000000000000000005 /* CLiteRTLM.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = F10000000000000000000003 /* CLiteRTLM.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		B20000000000000000000001 /* ApexoDemoApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = S10000000000000000000002 /* ApexoDemoApp.swift */; };
 		B20000000000000000000002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = S10000000000000000000001 /* ContentView.swift */; };
 		B20000000000000000000003 /* MicCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = S10000000000000000000003 /* MicCapture.swift */; };
 		B20000000000000000000004 /* DemoSupport.c in Sources */ = {isa = PBXBuildFile; fileRef = S10000000000000000000004 /* DemoSupport.c */; };
 /* End PBXBuildFile section */
 
+/* Begin PBXCopyFilesBuildPhase section */
+		P10000000000000000000003 /* Embed Frameworks */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+				B10000000000000000000004 /* SherpaOnnxC.xcframework in Embed Frameworks */,
+				B10000000000000000000005 /* CLiteRTLM.xcframework in Embed Frameworks */,
+			);
+			name = "Embed Frameworks";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
 		A10000000000000000000001 /* ApexoDemo.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ApexoDemo.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		F10000000000000000000001 /* ApexoSession.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = ApexoSession.xcframework; path = ../dist/ios/ApexoSession.xcframework; sourceTree = "<group>"; };
+		F10000000000000000000002 /* SherpaOnnxC.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = SherpaOnnxC.xcframework; path = ../dist/ios/SherpaOnnxC.xcframework; sourceTree = "<group>"; };
+		F10000000000000000000003 /* CLiteRTLM.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = CLiteRTLM.xcframework; path = ../dist/ios/CLiteRTLM.xcframework; sourceTree = "<group>"; };
 		S10000000000000000000001 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		S10000000000000000000002 /* ApexoDemoApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ApexoDemoApp.swift; sourceTree = "<group>"; };
 		S10000000000000000000003 /* MicCapture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MicCapture.swift; sourceTree = "<group>"; };
@@ -32,6 +53,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				B10000000000000000000001 /* ApexoSession.xcframework in Frameworks */,
+				B10000000000000000000002 /* SherpaOnnxC.xcframework in Frameworks */,
+				B10000000000000000000003 /* CLiteRTLM.xcframework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -43,6 +66,8 @@
 			children = (
 				G10000000000000000000002 /* ApexoDemo */,
 				F10000000000000000000001 /* ApexoSession.xcframework */,
+				F10000000000000000000002 /* SherpaOnnxC.xcframework */,
+				F10000000000000000000003 /* CLiteRTLM.xcframework */,
 				G10000000000000000000003 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -78,6 +103,7 @@
 			buildPhases = (
 				P10000000000000000000001 /* Sources */,
 				P10000000000000000000002 /* Frameworks */,
+				P10000000000000000000003 /* Embed Frameworks */,
 			);
 			buildRules = (
 			);

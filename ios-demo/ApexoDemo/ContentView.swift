@@ -23,7 +23,18 @@ struct ContentView: View {
                         transcript = "麦克风没有打开：\(error.localizedDescription)"
                     }
                 }
-                Button("结束一段") { mic.endSegment() }
+                Button("结束一段") {
+                    running = false
+                    mic.endSegment()
+                }
+                Button("阶段摘要") {
+                    mic.summarizeNew { summary in
+                        if !summary.isEmpty {
+                            transcript = summary
+                        }
+                    }
+                }
+                    .accessibilityIdentifier("summarizeNew")
                 Button("总结") {
                     running = false
                     transcript = "正在总结"

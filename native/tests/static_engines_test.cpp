@@ -41,9 +41,21 @@ int main(int argc, char** argv) {
   expect(pushed == 0, "the recognizer is bound to the linked symbols");
   expect(std::string(apexo_session_full_transcript(session)).find("适配器转写") != std::string::npos,
          "the linked recognizer's text enters the transcript");
+  setenv("APEXO_FAKE_NO_ENDPOINT", "1", 1);
+  setenv("APEXO_FAKE_FINISH_TEXT", "静态引擎收尾词", 1);
+  expect(apexo_session_push_pcm(session, pcm.data(), 1600, 16000) == 0 &&
+             apexo_session_end_segment(session) == 0 &&
+             std::string(apexo_session_full_transcript(session)).find("静态引擎收尾词") != std::string::npos,
+         "static engine mode binds SherpaOnnxOnlineStreamInputFinished and flushes tail speech on end_segment");
+  unsetenv("APEXO_FAKE_NO_ENDPOINT");
+  unsetenv("APEXO_FAKE_FINISH_TEXT");
   expect(apexo_session_summarize(session, summary, sizeof(summary)) == 0 &&
              std::string(summary).find("适配器摘要") != std::string::npos,
          "the linked LiteRT-LM generates the summary");
+  char text_sum[256];
+  expect(apexo_session_summarize_text(session, "外部文本", text_sum, sizeof(text_sum)) == 0 &&
+             std::string(text_sum).find("适配器摘要") != std::string::npos,
+         "static engine mode summarizes external text via apexo_session_summarize_text");
   apexo_session_destroy(session);
   apexo_engine_state_destroy(state);
 

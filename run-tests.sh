@@ -3,14 +3,13 @@ set -eu
 ROOT="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
 OUT="${1:-$ROOT/dist/macos/session_test}"
 mkdir -p "$(dirname "$OUT")" "$ROOT/dist/macos"
-if [ ! -f "$ROOT/dist/macos/libapexo_session.dylib" ]; then
-  clang++ -std=c++17 -dynamiclib -fPIC -arch "$(uname -m)" \
-    -install_name @rpath/libapexo_session.dylib \
-    -I "$ROOT/native/include" \
-    -o "$ROOT/dist/macos/libapexo_session.dylib" \
-    "$ROOT/native/src/session.cpp" \
-    "$ROOT/native/src/engine_adapter.cpp"
-fi
+clang++ -std=c++17 -dynamiclib -fPIC -arch "$(uname -m)" \
+  -install_name @rpath/libapexo_session.dylib \
+  -Wl,-rpath,@loader_path \
+  -I "$ROOT/native/include" \
+  -o "$ROOT/dist/macos/libapexo_session.dylib" \
+  "$ROOT/native/src/session.cpp" \
+  "$ROOT/native/src/engine_adapter.cpp"
 clang++ -std=c++17 "$ROOT/native/tests/session_test.cpp" \
   -I "$ROOT/native/include" \
   -L "$ROOT/dist/macos" -lapexo_session \
@@ -57,5 +56,8 @@ if [ -n "${APEXO_TEST_ASR_DIR:-}" ] && [ -n "${APEXO_SHERPA_LIBRARY:-}" ]; then
     -L "$ROOT/dist/macos" -lapexo_session \
     -Wl,-rpath,"$ROOT/dist/macos" \
     -o "$FAKES/real_engine_test"
-  "$FAKES/real_engine_test" "$APEXO_TEST_ASR_DIR" "$APEXO_TEST_ASR_DIR/test_wavs/0.wav" "${APEXO_TEST_ASR_EXPECT:-研究感兴趣}"
+  "$FAKES/real_engine_test" "$APEXO_TEST_ASR_DIR" "$APEXO_TEST_ASR_DIR/test_wavs/0.wav" "${APEXO_TEST_ASR_EXPECT:-对我做了介绍那么我想说的是大家如果对我的研究感兴趣呢}"
+  if [ -f "$APEXO_TEST_ASR_DIR/test_wavs/1.wav" ]; then
+    "$FAKES/real_engine_test" "$APEXO_TEST_ASR_DIR" "$APEXO_TEST_ASR_DIR/test_wavs/1.wav" "重点呢想谈三个问题首先呢就是这一轮全球金融动量的表现"
+  fi
 fi

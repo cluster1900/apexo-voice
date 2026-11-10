@@ -13,8 +13,8 @@
   <script type="importmap">
     {
       "imports": {
-        "@litert-lm/core": "/vendor/@litert-lm/core/dist/index.js",
-        "@litertjs/wasm-utils": "/vendor/@litertjs/wasm-utils/dist/index.js"
+        "@litert-lm/core": "/assets/apexo/litert/dist/index.js",
+        "@litertjs/wasm-utils": "/assets/apexo/wasm-utils/dist/index.js"
       }
     }
   </script>
@@ -25,6 +25,8 @@
   <p>
     <button id="mic" type="button">开始录音</button>
     <button id="stop" type="button">结束</button>
+    <button id="feed-test-audio" type="button">测试音频识别</button>
+    <button id="summarize-new" type="button">阶段摘要</button>
     <button id="summarize" type="button">总结</button>
     <button id="listen" type="button">回听刚才这一段</button>
   </p>
@@ -34,30 +36,77 @@
   </p>
   <p id="gemma-progress">总结要用这份网页版权重，大约 2 GB。</p>
   <p id="engine"></p>
+  <p id="browser-asr-offer">
+    <label>
+      <input id="use-browser-asr" type="checkbox">
+      启用浏览器自带识别（注意：浏览器可能把音频发送到云端在线服务）
+    </label>
+  </p>
   <p id="status"></p>
+
+  <hr style="margin: 2rem 0; border: none; border-top: 1px solid #ddd;">
+  <h2>纯文本总结测试（场景 2）</h2>
+  <p>无需麦克风与 ASR，直接对外部文本进行结构化摘要：</p>
+  <textarea id="external-input" rows="4" style="width: 100%; box-sizing: border-box; padding: 0.5rem;" placeholder="输入外部文本测试纯文本摘要（例如：会议决定原定周五发布，经评估取消周五计划，最终决定改到下周三下午发布...）"></textarea>
+  <p>
+    <button id="summarize-external" type="button">摘要外部文本</button>
+  </p>
+  <div id="external-summary" style="white-space: pre-wrap; border: 1px dashed #aaa; padding: 0.8rem; min-height: 3rem; background: #fafafa;"></div>
+
   <script type="module">
-    import { createSession } from "/sdk/index.js";
+    import { createSession, probeAsrFile } from "/sdk/index.js";
 
     const transcript = document.querySelector("#transcript");
     const status = document.querySelector("#status");
+    const engineLabel = document.querySelector("#engine");
+    const browserAsrCheckbox = document.querySelector("#use-browser-asr");
     const gemmaProgress = document.querySelector("#gemma-progress");
     const downloadButton = document.querySelector("#download");
     const gemmaWebFile = "gemma-4-E2B-it-gpu.litertlm";
     const session = createSession({
       summaryModelPath: gemmaWebFile,
       asrModelPath: "asr-model",
+      sherpaUrl: "/assets/apexo/sherpa/",
+      litertWasmUrl: "/assets/apexo/litert/",
       webSummary: true,
       onChange: () => paint(), // events from the recognizer worker arrive after pushPcm has returned
     });
 
+    let loadErrorReason = "";
     try {
       await session.loadRecognizer();
-    } catch {
-      // A present model that fails to load stays failed. Recording still keeps this segment.
+    } catch (err) {
+      // A present model that fails to load stays failed. Recording does not silently switch to cloud ASR.
+      loadErrorReason = String(err?.message || err || "unknown error");
     }
-    document.querySelector("#engine").textContent = session.recognizerState === "live"
-      ? "转写引擎：本机 sherpa-onnx，音频不离开浏览器。"
-      : "转写引擎：浏览器自带识别，Chrome 可能把音频发到云端。把四个语音模型文件放进 asr-model 目录后会改用本机识别。";
+
+    function updateEngineNotice() {
+      if (session.recognizerState === "live") {
+        engineLabel.textContent = "转写引擎：本机 sherpa-onnx，音频不离开浏览器。";
+      } else if (browserAsrCheckbox.checked) {
+        engineLabel.textContent = "转写引擎：已手动启用浏览器自带识别，浏览器可能把音频发到云端在线服务。";
+      } else if (session.recognizerState === "failed") {
+        engineLabel.textContent = `转写引擎：本机识别器加载失败（${loadErrorReason}）。默认不启用浏览器云端识别；如需临时使用请勾选下方选项。`;
+      } else {
+        engineLabel.textContent = "转写引擎：未检测到本地模型（请把 encoder.onnx、decoder.onnx、joiner.onnx、tokens.txt 放进 asr-model 目录）。默认不启用浏览器云端识别；如需临时使用请勾选下方选项。";
+      }
+    }
+    updateEngineNotice();
+    (async () => {
+      try {
+        if (await probeAsrFile(gemmaWebFile)) {
+          downloadButton.textContent = "Gemma 4 E2B 已就绪";
+          gemmaProgress.textContent = "检测到本地 Gemma 4 E2B 模型已就绪，可直接生成阶段摘要或总结。";
+        }
+      } catch {}
+    })();
+    browserAsrCheckbox.addEventListener("change", () => {
+      updateEngineNotice();
+      if (recording) {
+        if (browserAsrCheckbox.checked) startRecognition();
+        else stopRecognition();
+      }
+    });
 
     let audioContext;
     let workletModule = false;
@@ -114,7 +163,7 @@
 
     function startRecognition() {
       const Speech = window.SpeechRecognition || window.webkitSpeechRecognition;
-      if (!Speech || session.recognizerState === "live") return;
+      if (!Speech || session.recognizerState === "live" || !browserAsrCheckbox.checked) return;
       recognitionBlocked = false;
       committed = "";
       const next = new Speech();
@@ -160,7 +209,7 @@
 
     async function startRecording() {
       if (recording) return;
-      session.release();
+      session.reset();
       paint();
       media = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -190,8 +239,9 @@
       segmentStarted = Date.now();
       lastRate = audioContext.sampleRate;
       recording = true;
+      let acceptingWorkletTail = true;
       worklet.port.onmessage = (event) => {
-        if (!recording) return;
+        if (!acceptingWorkletTail) return;
         const samples = event.data instanceof Float32Array ? event.data : new Float32Array(event.data);
         segmentSamples.push(new Float32Array(samples));
         if (session.recognizerState === "live") {
@@ -199,21 +249,31 @@
           paint();
         }
       };
+      worklet.__stopTail = () => {
+        acceptingWorkletTail = false;
+      };
       source.connect(worklet);
       worklet.connect(mute);
       mute.connect(audioContext.destination);
-      startRecognition();
+      if (session.recognizerState !== "live" && browserAsrCheckbox.checked) {
+        startRecognition();
+      }
       status.textContent = "录音中";
     }
 
-    function finishRecording() {
+    async function finishRecording() {
       const wasRecording = recording;
       recording = false;
       stopRecognition();
       if (media) media.getTracks().forEach((track) => track.stop());
       media = null;
       if (source) source.disconnect();
-      if (worklet) worklet.disconnect();
+      // Let any already-queued AudioWorklet message arrive before closing the port.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      if (worklet) {
+        if (typeof worklet.__stopTail === "function") worklet.__stopTail();
+        worklet.disconnect();
+      }
       if (mute) mute.disconnect();
       source = null;
       worklet = null;
@@ -222,7 +282,11 @@
         lastSegment = concat(segmentSamples);
         segmentSamples = [];
       }
-      session.endSegment();
+      try {
+        await session.endSegment();
+      } catch {
+        // Recognizer failed to finish; preserve existing transcript.
+      }
       paint();
       status.textContent = "这一段已结束";
     }
@@ -237,12 +301,12 @@
       });
     });
 
-    document.querySelector("#stop").addEventListener("click", () => {
+    document.querySelector("#stop").addEventListener("click", async () => {
       if (!recording && !lastSegment.length) {
         status.textContent = "还没有开始录音";
         return;
       }
-      finishRecording();
+      await finishRecording();
     });
 
     document.querySelector("#listen").addEventListener("click", () => {
@@ -260,8 +324,36 @@
       status.textContent = "正在回放刚才这一段";
     });
 
+    document.querySelector("#summarize-new").addEventListener("click", async () => {
+      await session.drain();
+      const spoken = session.fullTranscript;
+      if (!spoken) {
+        status.textContent = "还没有可总结的已定稿文字";
+        return;
+      }
+      status.textContent = "正在生成阶段摘要";
+      try {
+        const stageSummary = await session.summarizeNew();
+        const currentSpoken = session.fullTranscript || spoken;
+        transcript.textContent = stageSummary
+          ? `${currentSpoken}\n\n阶段摘要\n${stageSummary}`
+          : currentSpoken;
+        status.textContent = recording ? "录音中（阶段摘要已更新）" : "阶段摘要完成";
+      } catch (err) {
+        const currentSpoken = session.fullTranscript || spoken;
+        transcript.textContent = currentSpoken;
+        if (err?.code === -3) {
+          status.textContent = "这一段的文字在上面。网页版 Gemma 权重不在，还不能另写总结。";
+        } else if (err?.code === -6) {
+          status.textContent = "已有总结正在运行";
+        } else {
+          status.textContent = `阶段摘要没有跑起来：${session.lastError || err?.message || ""}`;
+        }
+      }
+    });
+
     document.querySelector("#summarize").addEventListener("click", async () => {
-      if (recording) finishRecording();
+      if (recording) await finishRecording();
       await session.drain();
       const spoken = session.fullTranscript;
       if (!spoken) {
@@ -270,21 +362,18 @@
       }
       status.textContent = "正在总结";
       try {
-        const result = await session.summarizeWithGemma(gemmaWebFile);
-        if (result.summary === -3) {
-          transcript.textContent = spoken;
-          status.textContent = "这一段的文字在上面。网页版 Gemma 权重不在，还不能另写总结。";
-          return;
-        }
-        if (typeof result.summary !== "string") {
-          transcript.textContent = spoken;
-          status.textContent = `总结没有跑起来：${session.lastError}`;
-          return;
-        }
-        transcript.textContent = `${spoken}\n\n总结\n${result.summary}`;
+        const summary = await session.summarize();
+        transcript.textContent = `${spoken}\n\n总结\n${summary}`;
         status.textContent = session.gemmaResident ? "Gemma 仍驻留" : "总结完成";
-      } catch {
-        status.textContent = "总结没有跑起来";
+      } catch (err) {
+        transcript.textContent = spoken;
+        if (err?.code === -3) {
+          status.textContent = "这一段的文字在上面。网页版 Gemma 权重不在，还不能另写总结。";
+        } else if (err?.code === -6) {
+          status.textContent = "已有总结正在运行";
+        } else {
+          status.textContent = `总结没有跑起来：${session.lastError || err?.message || ""}`;
+        }
       }
     });
 
@@ -317,6 +406,66 @@
         downloading = false;
         downloadButton.disabled = false;
         gemmaProgress.textContent = "Gemma 4 E2B 没有下载下来。";
+      }
+    });
+
+    document.querySelector("#feed-test-audio").addEventListener("click", async () => {
+      if (recording) return;
+      session.reset();
+      paint();
+      status.textContent = "正在加载测试音频...";
+      try {
+        const res = await fetch("/test.wav");
+        if (!res.ok) throw new Error("test.wav not found");
+        const arrayBuf = await res.arrayBuffer();
+        if (!audioContext || audioContext.state === "closed") {
+          audioContext = new AudioContext({ sampleRate: 16000 });
+        }
+        if (audioContext.state === "suspended") await audioContext.resume();
+        const decoded = await audioContext.decodeAudioData(arrayBuf);
+        const pcm = decoded.getChannelData(0);
+        segmentSamples = [pcm];
+        lastSegment = pcm;
+        lastRate = decoded.sampleRate;
+        status.textContent = "正在识别测试音频...";
+        const chunkSize = 1600;
+        for (let i = 0; i < pcm.length; i += chunkSize) {
+          const chunk = pcm.subarray(i, Math.min(i + chunkSize, pcm.length));
+          session.pushPcm(chunk, decoded.sampleRate);
+          paint();
+          await new Promise((r) => setTimeout(r, 20));
+        }
+        await session.drain();
+        await session.endSegment();
+        paint();
+        status.textContent = "测试音频识别完成，可以点击阶段摘要或总结。";
+      } catch (err) {
+        status.textContent = `测试音频识别失败：${err.message || err}`;
+      }
+    });
+
+    const externalInput = document.querySelector("#external-input");
+    const externalSummary = document.querySelector("#external-summary");
+    const summarizeExternalBtn = document.querySelector("#summarize-external");
+
+    summarizeExternalBtn.addEventListener("click", async () => {
+      const text = externalInput.value.trim();
+      if (!text) {
+        externalSummary.textContent = "请先在上方输入需要总结的文本。";
+        return;
+      }
+      externalSummary.textContent = "正在生成外部文本总结...";
+      try {
+        const result = await session.summarize(text);
+        externalSummary.textContent = result || "（无总结结果）";
+      } catch (err) {
+        if (err?.code === -3) {
+          externalSummary.textContent = "Gemma 权重未找到，请先确保模型就绪。";
+        } else if (err?.code === -6) {
+          externalSummary.textContent = "已有总结正在运行中。";
+        } else {
+          externalSummary.textContent = `总结失败：${err.message || err}`;
+        }
       }
     });
   </script>
