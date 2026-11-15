@@ -13,6 +13,8 @@ struct Boxed {
   JavaVM* jvm = nullptr;
   jobject callback_target = nullptr;
   jmethodID dispatch_mid = nullptr;
+  jobject trans_callback_target = nullptr;
+  jmethodID trans_dispatch_mid = nullptr;
 };
 
 static Boxed* box_from(jlong handle) { return reinterpret_cast<Boxed*>(handle); }
@@ -140,6 +142,41 @@ void jni_transcript_callback(void* user, const ApexoAsrEvent* event) {
   if (attached) box->jvm->DetachCurrentThread();
 }
 
+void jni_translation_callback(void* user, const ApexoAsrEvent* event) {
+  Boxed* box = static_cast<Boxed*>(user);
+  if (box == nullptr || event == nullptr || box->jvm == nullptr || box->trans_callback_target == nullptr ||
+      box->trans_dispatch_mid == nullptr) {
+    return;
+  }
+  JNIEnv* env = nullptr;
+  bool attached = false;
+  const jint get_rc = box->jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+  if (get_rc == JNI_EDETACHED) {
+#if defined(__ANDROID__)
+    if (box->jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
+#else
+    if (box->jvm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr) != JNI_OK) return;
+#endif
+    attached = true;
+  } else if (get_rc != JNI_OK || env == nullptr) {
+    return;
+  }
+  jstring jtext = std_utf8_to_jstring(env, event->text);
+  if (jtext != nullptr) {
+    env->CallVoidMethod(box->trans_callback_target, box->trans_dispatch_mid, jtext,
+                        static_cast<jboolean>(event->is_final == 1), static_cast<jint>(event->start_ms),
+                        static_cast<jint>(event->end_ms));
+    if (env->ExceptionCheck()) {
+      env->ExceptionDescribe();
+      env->ExceptionClear();
+    }
+    env->DeleteLocalRef(jtext);
+  } else if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+  }
+  if (attached) box->jvm->DetachCurrentThread();
+}
+
 }  // namespace
 
 extern "C" JNIEXPORT jlong JNICALL Java_com_apexo_sdk_ApexoSession_nativeCreate(JNIEnv* env, jclass,
@@ -173,13 +210,56 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_apexo_sdk_ApexoSession_nativeCreate(
   return reinterpret_cast<jlong>(box);
 }
 
+extern "C" JNIEXPORT jlong JNICALL Java_com_apexo_sdk_ApexoSession_nativeCreateWithLanguages(
+    JNIEnv* env, jclass, jstring asr_model_dir, jstring translation_model_dir, jstring model_path, jstring source_lang,
+    jstring target_lang) {
+  Utf8 asr(env, asr_model_dir);
+  Utf8 trans(env, translation_model_dir);
+  Utf8 gemma(env, model_path);
+  Utf8 src_lang(env, source_lang);
+  Utf8 tgt_lang(env, target_lang);
+  Boxed* box = new Boxed();
+  box->session = nullptr;
+  box->engines = apexo_engine_state_create(asr.get(), gemma.get());
+  if (!trans.is_null && !trans.text.empty()) {
+    apexo_engine_state_set_translation_model_dirs(box->engines, trans.get(), "");
+  }
+  ApexoConfig config;
+  std::memset(&config, 0, sizeof(config));
+  config.merge_gap_ms = APEXO_MERGE_GAP_MS;
+  config.summary_chunk_chars = APEXO_SUMMARY_CHUNK_CHARS;
+  config.display_lines = APEXO_DISPLAY_LINES;
+  config.summary_model_path = gemma.get();
+  config.web_summary = 0;
+  config.source_lang = src_lang.nullable_get();
+  config.target_lang = tgt_lang.nullable_get();
+  ApexoEngines engines;
+  if (apexo_engine_state_bind(box->engines, &engines) != 0) {
+    apexo_engine_state_destroy(box->engines);
+    delete box;
+    return 0;
+  }
+  box->session = apexo_session_create(&config, &engines);
+  if (box->session == nullptr) {
+    apexo_engine_state_destroy(box->engines);
+    delete box;
+    return 0;
+  }
+  return reinterpret_cast<jlong>(box);
+}
+
 extern "C" JNIEXPORT void JNICALL Java_com_apexo_sdk_ApexoSession_nativeDestroy(JNIEnv* env, jclass, jlong handle) {
   Boxed* box = box_from(handle);
   if (box == nullptr) return;
   apexo_session_set_transcript_callback(box->session, nullptr, nullptr);
+  apexo_session_set_translation_callback(box->session, nullptr, nullptr);
   if (box->callback_target != nullptr && env != nullptr) {
     env->DeleteGlobalRef(box->callback_target);
     box->callback_target = nullptr;
+  }
+  if (box->trans_callback_target != nullptr && env != nullptr) {
+    env->DeleteGlobalRef(box->trans_callback_target);
+    box->trans_callback_target = nullptr;
   }
   apexo_session_reset(box->session);
   apexo_session_destroy(box->session);
@@ -333,4 +413,109 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_apexo_sdk_ApexoSession_nativeSumma
   Boxed* box = box_from(handle);
   if (box == nullptr) return std_utf8_to_jstring(env, "");
   return std_utf8_to_jstring(env, apexo_session_summary_text(box->session));
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_apexo_sdk_ApexoSession_nativeSetOrtLibrary(JNIEnv* env, jclass, jlong handle,
+                                                                                      jstring ort_library) {
+  Boxed* box = box_from(handle);
+  if (box == nullptr) return;
+  Utf8 ort(env, ort_library);
+  apexo_engine_state_set_ort_library(box->engines, ort.get());
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_apexo_sdk_ApexoSession_nativeSetAsrModelDir(JNIEnv* env, jclass,
+                                                                                       jlong handle,
+                                                                                       jstring asr_model_dir) {
+  Boxed* box = box_from(handle);
+  if (box == nullptr) return;
+  Utf8 asr(env, asr_model_dir);
+  apexo_engine_state_set_asr_model_dir(box->engines, asr.get());
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_apexo_sdk_ApexoSession_nativeSetTranslationModelDirs(
+    JNIEnv* env, jclass, jlong handle, jstring model_dir, jstring pivot_model_dir) {
+  Boxed* box = box_from(handle);
+  if (box == nullptr) return;
+  Utf8 dir1(env, model_dir);
+  Utf8 dir2(env, pivot_model_dir);
+  apexo_engine_state_set_translation_model_dirs(box->engines, dir1.get(), dir2.get());
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_apexo_sdk_ApexoSession_nativeSetLanguages(JNIEnv* env, jclass, jlong handle,
+                                                                                     jstring source_lang,
+                                                                                     jstring target_lang) {
+  Boxed* box = box_from(handle);
+  if (box == nullptr) return;
+  Utf8 src(env, source_lang);
+  Utf8 tgt(env, target_lang);
+  apexo_session_set_languages(box->session, src.nullable_get(), tgt.nullable_get());
+}
+
+extern "C" JNIEXPORT jstring JNICALL Java_com_apexo_sdk_ApexoSession_nativeSourceLang(JNIEnv* env, jclass,
+                                                                                      jlong handle) {
+  Boxed* box = box_from(handle);
+  if (box == nullptr) return std_utf8_to_jstring(env, "");
+  return std_utf8_to_jstring(env, apexo_session_source_lang(box->session));
+}
+
+extern "C" JNIEXPORT jstring JNICALL Java_com_apexo_sdk_ApexoSession_nativeTargetLang(JNIEnv* env, jclass,
+                                                                                      jlong handle) {
+  Boxed* box = box_from(handle);
+  if (box == nullptr) return std_utf8_to_jstring(env, "");
+  return std_utf8_to_jstring(env, apexo_session_target_lang(box->session));
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_apexo_sdk_ApexoSession_nativeSetTranslationCallback(JNIEnv* env, jclass,
+                                                                                               jlong handle,
+                                                                                               jobject target) {
+  Boxed* box = box_from(handle);
+  if (box == nullptr || env == nullptr) return;
+  apexo_session_set_translation_callback(box->session, nullptr, nullptr);
+  if (box->trans_callback_target != nullptr) {
+    env->DeleteGlobalRef(box->trans_callback_target);
+    box->trans_callback_target = nullptr;
+  }
+  box->trans_dispatch_mid = nullptr;
+  if (target == nullptr) return;
+  if (env->GetJavaVM(&box->jvm) != JNI_OK || box->jvm == nullptr) return;
+  jclass cls = env->GetObjectClass(target);
+  if (cls == nullptr) return;
+  jmethodID mid = env->GetMethodID(cls, "dispatchTranslation", "(Ljava/lang/String;ZII)V");
+  env->DeleteLocalRef(cls);
+  if (mid == nullptr) return;
+  box->trans_callback_target = env->NewGlobalRef(target);
+  if (box->trans_callback_target == nullptr) return;
+  box->trans_dispatch_mid = mid;
+  apexo_session_set_translation_callback(box->session, jni_translation_callback, box);
+}
+
+extern "C" JNIEXPORT jstring JNICALL Java_com_apexo_sdk_ApexoSession_nativeTranslatedDisplay(JNIEnv* env, jclass,
+                                                                                             jlong handle) {
+  Boxed* box = box_from(handle);
+  if (box == nullptr) return std_utf8_to_jstring(env, "");
+  return std_utf8_to_jstring(env, apexo_session_translated_display_text(box->session));
+}
+
+extern "C" JNIEXPORT jstring JNICALL Java_com_apexo_sdk_ApexoSession_nativeFullTranslation(JNIEnv* env, jclass,
+                                                                                           jlong handle) {
+  Boxed* box = box_from(handle);
+  if (box == nullptr) return std_utf8_to_jstring(env, "");
+  return std_utf8_to_jstring(env, apexo_session_full_translation(box->session));
+}
+
+extern "C" JNIEXPORT jstring JNICALL Java_com_apexo_sdk_ApexoSession_nativeTranslateText(JNIEnv* env, jclass,
+                                                                                         jlong handle, jstring text,
+                                                                                         jintArray rc_out) {
+  Boxed* box = box_from(handle);
+  if (box == nullptr) {
+    write_rc(env, rc_out, -1);
+    return nullptr;
+  }
+  Utf8 utf8_text(env, text);
+  std::string out(262144, '\0');
+  const int rc =
+      apexo_session_translate_text(box->session, utf8_text.nullable_get(), &out[0], static_cast<int32_t>(out.size()));
+  write_rc(env, rc_out, rc);
+  if (rc != 0) return nullptr;
+  return std_utf8_to_jstring(env, out.c_str());
 }

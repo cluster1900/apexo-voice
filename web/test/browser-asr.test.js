@@ -6,7 +6,8 @@
 // transducer), plus a 16 kHz mono 16-bit wav at either wav/0.wav or test_wavs/0.wav. The sentence in the wav
 // must contain the text in APEXO_TEST_ASR_EXPECT (default: 研究感兴趣, for the zh-14M test_wavs/0.wav).
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, unlinkSync, symlinkSync, lstatSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -24,7 +25,8 @@ const expected = process.env.APEXO_TEST_ASR_EXPECT || "研究感兴趣";
 
 const { chromium } = await import("playwright");
 const demoRoot = fileURLToPath(new URL("../demo/", import.meta.url));
-const link = join(demoRoot, "asr-model");
+const dataTmp = mkdtempSync(join(tmpdir(), "apexo-browser-asr-data-"));
+const link = join(dataTmp, "asr-model");
 const port = 41823;
 let failures = 0;
 function expect(ok, name) {
@@ -35,16 +37,12 @@ function expect(ok, name) {
   }
 }
 
-let linked = false;
-try {
-  lstatSync(link);
-  throw new Error(`${link} already exists; remove it and run again`);
-} catch (error) {
-  if (error.code !== "ENOENT") throw error;
-}
 symlinkSync(modelDir, link);
-linked = true;
-const server = spawn(process.execPath, ["server.js"], { cwd: demoRoot, env: { ...process.env, PORT: String(port) }, stdio: "ignore" });
+const server = spawn(process.execPath, ["server.js"], {
+  cwd: demoRoot,
+  env: { ...process.env, PORT: String(port), APEXO_DEMO_DATA_DIR: dataTmp },
+  stdio: "ignore",
+});
 try {
   await new Promise((resolve) => setTimeout(resolve, 1000));
   const wav = readFileSync(wavPath);
@@ -152,7 +150,7 @@ try {
   expect(pageErrors.length === 0, "the page stays free of errors");
 } finally {
   server.kill("SIGTERM");
-  if (linked) unlinkSync(link);
+  rmSync(dataTmp, { recursive: true, force: true });
 }
 if (failures !== 0) {
   console.log(`${failures} failure(s)`);

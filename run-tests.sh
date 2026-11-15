@@ -47,6 +47,7 @@ node "$ROOT/web/test/asr-presence.test.js"
 node "$ROOT/web/test/capture.test.js"
 node "$ROOT/web/test/demo-flow.test.js"
 node "$ROOT/web/test/asr-pipeline.test.js"
+node "$ROOT/web/test/translation.test.js"
 # Opt-in: real recognizer and real model. APEXO_TEST_ASR_DIR holds encoder.onnx, decoder.onnx, joiner.onnx,
 # tokens.txt and test_wavs/0.wav; APEXO_SHERPA_LIBRARY is the sherpa-onnx C library (for the native part).
 node "$ROOT/web/test/browser-asr.test.js"

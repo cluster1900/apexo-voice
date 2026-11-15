@@ -229,6 +229,65 @@ int main(int argc, char** argv) {
   apexo_session_destroy(nolib);
   apexo_engine_state_destroy(nolib_state);
 
+  // Translation adapter contract: missing translation directory returns -3 without inventing text;
+  // dynamic ASR / translation directory setters work cleanly; real ONNX MarianMT runs when assets are present.
+  setenv("APEXO_SHERPA_LIBRARY", argv[1], 1);
+  setenv("APEXO_LITERT_LIBRARY", argv[2], 1);
+  {
+    void* tstate = apexo_engine_state_create(dir.c_str(), gemma.c_str());
+    apexo_engine_state_set_translation_model_dirs(tstate, (dir + "/missing-trans").c_str(), "");
+    ApexoEngines tengines;
+    apexo_engine_state_bind(tstate, &tengines);
+    ApexoConfig tcfg;
+    std::memset(&tcfg, 0, sizeof(tcfg));
+    tcfg.summary_model_path = gemma.c_str();
+    tcfg.source_lang = "zh";
+    tcfg.target_lang = "en";
+    ApexoSession* tsess = apexo_session_create(&tcfg, &tengines);
+    char tout[512];
+    std::memset(tout, 'x', sizeof(tout));
+    expect(apexo_session_translate_text(tsess, "你好世界", tout, sizeof(tout)) == -3 && tout[0] == '\0',
+           "missing translation model directory returns -3 and writes no invented text");
+
+    // Real ONNX Runtime MarianMT verification when local real-assets/trans-zh-en and libonnxruntime.dylib exist.
+    const std::string real_trans_dir = "native/tests/build/real-assets/trans-zh-en";
+    const std::string real_ort_dylib =
+        "native/tests/build/real-assets/sherpa-onnx-v2.0.1-osx-arm64-shared-no-tts-lib/lib/libonnxruntime.dylib";
+    if (access((real_trans_dir + "/encoder_model.onnx").c_str(), R_OK) == 0 &&
+        access(real_ort_dylib.c_str(), R_OK) == 0) {
+      apexo_engine_state_set_ort_library(tstate, real_ort_dylib.c_str());
+      apexo_engine_state_set_translation_model_dirs(tstate, real_trans_dir.c_str(), "");
+      const int trc = apexo_session_translate_text(tsess, "今天下午三点开会，决定下周三发布新版本。", tout, sizeof(tout));
+      const std::string translated(tout);
+      std::string lower = translated;
+      for (char& c : lower) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+      }
+      expect(trc == 0 && !translated.empty() &&
+                 (lower.find("meet") != std::string::npos || lower.find("wednesday") != std::string::npos ||
+                  lower.find("release") != std::string::npos),
+             "real ONNX MarianMT translates zh -> en accurately via libonnxruntime");
+
+      // Live push_pcm -> real-time ONNX translation -> target-language Gemma prompt verification!
+      write_file(log_path, "");
+      expect(apexo_session_push_pcm(tsess, pcm.data(), static_cast<int32_t>(pcm.size()), 16000) == 0,
+             "live push_pcm succeeds with real ONNX translator bound");
+      const std::string live_trans = apexo_session_full_translation(tsess);
+      expect(!live_trans.empty() && live_trans != "适配器转写",
+             "live push_pcm translates finalized utterance via ONNX MarianMT into full_translation");
+      char en_summary[512];
+      expect(apexo_session_summarize(tsess, en_summary, sizeof(en_summary)) == 0,
+             "summarize succeeds after live ONNX translation");
+      const std::string tlog = read_file(log_path);
+      expect(tlog.find("strictly in English") != std::string::npos &&
+                 tlog.find(live_trans) != std::string::npos,
+             "summarize passes real ONNX B-language translation and English prompt to Gemma");
+    }
+
+    apexo_session_destroy(tsess);
+    apexo_engine_state_destroy(tstate);
+  }
+
   remove_tree(dir);
   if (g_failures != 0) {
     std::cout << g_failures << " failure(s)\n";

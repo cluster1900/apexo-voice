@@ -1,10 +1,14 @@
 import { spawn } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const playwright = await import("playwright");
 const { chromium } = playwright.default ?? playwright;
 
 const demoRoot = fileURLToPath(new URL("../demo/", import.meta.url));
+const dataTmp = mkdtempSync(join(tmpdir(), "apexo-demo-flow-data-"));
 const port = 41931;
 const origin = `http://127.0.0.1:${port}/`;
 
@@ -20,7 +24,7 @@ function expect(ok, name) {
 
 const child = spawn(process.execPath, ["server.js"], {
   cwd: demoRoot,
-  env: { ...process.env, PORT: String(port) },
+  env: { ...process.env, PORT: String(port), APEXO_DEMO_DATA_DIR: dataTmp },
   stdio: ["ignore", "pipe", "pipe"],
 });
 let serverLog = "";
@@ -103,8 +107,14 @@ try {
   expect(response.headers()["cross-origin-opener-policy"] === "same-origin" && response.headers()["cross-origin-embedder-policy"] === "require-corp", "demo is served with COOP and COEP");
   const labels = await page.locator("button").allInnerTexts();
   expect(
-    labels.join(",") === "开始录音,结束,阶段摘要,总结,回听刚才这一段,下载 Gemma 4 E2B",
-    "start, end, stage summary, summarize, replay, and the Gemma 4 E2B download are shown",
+    labels.some((l) => l.startsWith("下载所需语言包")) &&
+      labels.includes("开始录音") &&
+      labels.includes("结束") &&
+      labels.includes("阶段摘要") &&
+      labels.includes("总结") &&
+      labels.includes("回听刚才这一段") &&
+      labels.includes("下载 Gemma 4 E2B"),
+    "language pack download, start, end, stage summary, summarize, replay, and the Gemma 4 E2B download are shown",
   );
   expect(await page.locator("#download").isVisible() && (await page.locator("#gemma-file").innerText()).includes("gemma-4-E2B-it-gpu.litertlm"), "the Gemma 4 E2B download and file name are visible");
   expect((await page.locator("#gemma-progress").innerText()).includes("2 GB"), "the download explains that summary needs the weights");
@@ -202,6 +212,7 @@ try {
   await browser.close();
 } finally {
   if (!child.killed) child.kill("SIGTERM");
+  rmSync(dataTmp, { recursive: true, force: true });
 }
 
 if (failures !== 0) {

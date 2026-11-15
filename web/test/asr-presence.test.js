@@ -9,7 +9,8 @@ import { copyApexoRuntime } from "../scripts/copy-runtime.mjs";
 
 const CANNED = "你好，这是已经成稿的一句。";
 const demoRoot = fileURLToPath(new URL("../demo/", import.meta.url));
-const asrDir = join(demoRoot, "asr-model");
+const dataTmp = mkdtempSync(join(tmpdir(), "apexo-asr-presence-data-"));
+const asrDir = join(dataTmp, "asr-model");
 const port = 41821;
 const base = `http://127.0.0.1:${port}/asr-model`;
 const names = ["encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"];
@@ -44,16 +45,18 @@ expect(
 // T10: copy-runtime.mjs copies sherpa-onnx and @litert-lm/core runtime files into a custom directory.
 const runtimeTmp = mkdtempSync(join(tmpdir(), "apexo-runtime-"));
 try {
-  const { sherpaDir, litertDir } = copyApexoRuntime(join(runtimeTmp, "meeting/assets/apexo"), {
+  const { sherpaDir, litertDir, ortDir } = copyApexoRuntime(join(runtimeTmp, "meeting/assets/apexo"), {
     fromDir: fileURLToPath(new URL("..", import.meta.url)),
   });
   expect(
     existsSync(join(sherpaDir, "sherpa-onnx-wasm-nodejs.js")) &&
       existsSync(join(sherpaDir, "sherpa-onnx-asr.js")) &&
       existsSync(join(sherpaDir, "sherpa-onnx-wasm-nodejs.wasm")) &&
+      existsSync(join(ortDir, "ort.wasm.min.mjs")) &&
+      existsSync(join(ortDir, "ort-wasm-simd-threaded.wasm")) &&
       existsSync(litertDir) &&
       readdirSync(litertDir).some((n) => n.endsWith(".wasm") || n.endsWith(".js")),
-    "T10: copy-runtime.mjs copies sherpa and litert runtime assets into custom target directory",
+    "T10: copy-runtime.mjs copies sherpa, ort, and litert runtime assets into custom target directory",
   );
 } finally {
   rmSync(runtimeTmp, { recursive: true, force: true });
@@ -64,7 +67,7 @@ for (const name of names) writeFileSync(join(asrDir, name), "not-a-model");
 
 const child = spawn(process.execPath, ["server.js"], {
   cwd: demoRoot,
-  env: { ...process.env, PORT: String(port) },
+  env: { ...process.env, PORT: String(port), APEXO_DEMO_DATA_DIR: dataTmp },
   stdio: ["ignore", "pipe", "pipe"],
 });
 
@@ -137,13 +140,7 @@ try {
   expect(absent.recognizerState === "missing", "missing tokens.txt leaves the recognizer in the missing state");
 } finally {
   stopServer();
-  let entries = [];
-  try {
-    entries = readdirSync(asrDir);
-  } catch {
-    entries = [];
-  }
-  if (entries.every((name) => names.includes(name))) rmSync(asrDir, { recursive: true, force: true });
+  rmSync(dataTmp, { recursive: true, force: true });
 }
 
 if (failures !== 0) {

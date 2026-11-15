@@ -15,7 +15,7 @@ export function requiredAsrFiles(dir) {
   };
 }
 
-export function onlineRecognizerConfig(dir) {
+export function onlineRecognizerConfig(dir, options = {}) {
   const files = requiredAsrFiles(dir);
   return {
     featConfig: { sampleRate: 16000, featureDim: 80 },
@@ -29,7 +29,7 @@ export function onlineRecognizerConfig(dir) {
       numThreads: 1,
       provider: "cpu",
       debug: 0,
-      modelingUnit: "cjkchar",
+      modelingUnit: options?.modelingUnit || "",
     },
     decodingMethod: "greedy_search",
     maxActivePaths: 4,

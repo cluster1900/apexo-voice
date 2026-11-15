@@ -2,12 +2,25 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <title>Apexo</title>
+  <title>Apexo — 实时语音识别 · 离线翻译 · 智能总结</title>
   <style>
-    body { font-family: sans-serif; margin: 2rem; max-width: 40rem; }
-    #transcript { min-height: 8rem; white-space: pre-wrap; border: 1px solid #ccc; padding: 1rem; }
-    button { margin-right: 0.5rem; margin-bottom: 0.5rem; }
-    #download { font-size: 1rem; padding: 0.45rem 0.8rem; }
+    body { font-family: system-ui, -apple-system, sans-serif; margin: 2rem auto; padding: 0 1.25rem; max-width: 56rem; color: #1f2937; line-height: 1.5; }
+    h1 { margin-bottom: 0.75rem; font-size: 1.5rem; }
+    .lang-card { border: 1px solid #d1d5db; border-radius: 8px; padding: 0.9rem 1rem; margin-bottom: 1rem; background: #f9fafb; }
+    .lang-row { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem; margin-bottom: 0.5rem; }
+    .lang-row select { font-size: 0.95rem; padding: 0.35rem 0.55rem; border: 1px solid #cbd5e1; border-radius: 6px; background: #fff; }
+    #pack-status { font-size: 0.9rem; color: #374151; margin: 0.35rem 0; }
+    #pack-progress { font-size: 0.88rem; color: #2563eb; min-height: 1.2rem; margin: 0.2rem 0 0; }
+    .badge-ok { display: inline-block; padding: 0.08rem 0.45rem; border-radius: 999px; background: #dcfce7; color: #166534; font-size: 0.8rem; margin-left: 0.25rem; }
+    .badge-miss { display: inline-block; padding: 0.08rem 0.45rem; border-radius: 999px; background: #fef3c7; color: #92400e; font-size: 0.8rem; margin-left: 0.25rem; }
+    .panes { display: grid; grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr)); gap: 1rem; margin-bottom: 0.8rem; }
+    .pane-label { font-size: 0.9rem; font-weight: 600; color: #4b5563; margin-bottom: 0.35rem; }
+    #transcript, #translation { min-height: 8.5rem; white-space: pre-wrap; border: 1px solid #cbd5e1; border-radius: 6px; padding: 0.9rem; background: #fff; }
+    #translation { background: #f8fafc; }
+    #translation-status { margin: 0.4rem 0 0; color: #64748b; font-size: 0.85rem; }
+    #summary-panel { margin-top: 0.75rem; border: 1px solid #dbeafe; border-radius: 6px; padding: 0.85rem 1rem; background: #eff6ff; white-space: pre-wrap; display: none; }
+    button { margin-right: 0.45rem; margin-bottom: 0.45rem; padding: 0.4rem 0.75rem; font-size: 0.95rem; cursor: pointer; }
+    #download { font-size: 0.95rem; padding: 0.45rem 0.8rem; }
     #gemma-file { font-family: ui-monospace, monospace; }
   </style>
   <script type="importmap">
@@ -20,8 +33,34 @@
   </script>
 </head>
 <body>
-  <h1>实时转写</h1>
-  <div id="transcript" aria-label="transcript"></div>
+  <h1>实时转写 · 翻译 · 总结</h1>
+
+  <section class="lang-card" aria-label="language-settings">
+    <div class="lang-row">
+      <label for="source-lang"><strong>输入语言 (A)：</strong></label>
+      <select id="source-lang"></select>
+      <button id="swap-lang" type="button">互换语言</button>
+      <label for="target-lang"><strong>目标语言 (B)：</strong></label>
+      <select id="target-lang"></select>
+      <button id="download-packs" type="button">下载所需语言包</button>
+    </div>
+    <div id="pack-status">正在检查本地语言包状态…</div>
+    <div id="pack-progress"></div>
+  </section>
+
+  <div class="panes">
+    <div>
+      <div class="pane-label" id="source-pane-title">录入原文 (A)</div>
+      <div id="transcript" aria-label="transcript"></div>
+    </div>
+    <div>
+      <div class="pane-label" id="target-pane-title">实时翻译 (B)</div>
+      <div id="translation" aria-label="translation"></div>
+      <p id="translation-status" role="status" aria-live="polite">每 3 秒更新翻译预览，句子定稿后确认完整译文。</p>
+    </div>
+  </div>
+  <div id="summary-panel" aria-label="summary"></div>
+
   <p>
     <button id="mic" type="button">开始录音</button>
     <button id="stop" type="button">结束</button>
@@ -46,7 +85,7 @@
 
   <hr style="margin: 2rem 0; border: none; border-top: 1px solid #ddd;">
   <h2>纯文本总结测试（场景 2）</h2>
-  <p>无需麦克风与 ASR，直接对外部文本进行结构化摘要：</p>
+  <p>无需麦克风与 ASR，直接按上方选择的目标语言 (B) 对外部文本生成结构化摘要：</p>
   <textarea id="external-input" rows="4" style="width: 100%; box-sizing: border-box; padding: 0.5rem;" placeholder="输入外部文本测试纯文本摘要（例如：会议决定原定周五发布，经评估取消周五计划，最终决定改到下周三下午发布...）"></textarea>
   <p>
     <button id="summarize-external" type="button">摘要外部文本</button>
@@ -54,57 +93,245 @@
   <div id="external-summary" style="white-space: pre-wrap; border: 1px dashed #aaa; padding: 0.8rem; min-height: 3rem; background: #fafafa;"></div>
 
   <script type="module">
-    import { createSession, probeAsrFile } from "/sdk/index.js";
+    import {
+      createSession,
+      SUPPORTED_LANGUAGES,
+      speechRecognitionLangFor,
+    } from "/sdk/index.js";
 
     const transcript = document.querySelector("#transcript");
+    const translationBox = document.querySelector("#translation");
+    const translationStatus = document.querySelector("#translation-status");
+    const summaryPanel = document.querySelector("#summary-panel");
+    const sourceSelect = document.querySelector("#source-lang");
+    const targetSelect = document.querySelector("#target-lang");
+    const swapBtn = document.querySelector("#swap-lang");
+    const downloadPacksBtn = document.querySelector("#download-packs");
+    const packStatusEl = document.querySelector("#pack-status");
+    const packProgressEl = document.querySelector("#pack-progress");
+    const sourcePaneTitle = document.querySelector("#source-pane-title");
+    const targetPaneTitle = document.querySelector("#target-pane-title");
     const status = document.querySelector("#status");
     const engineLabel = document.querySelector("#engine");
     const browserAsrCheckbox = document.querySelector("#use-browser-asr");
     const gemmaProgress = document.querySelector("#gemma-progress");
     const downloadButton = document.querySelector("#download");
     const gemmaWebFile = "gemma-4-E2B-it-gpu.litertlm";
+
+    for (const lang of SUPPORTED_LANGUAGES) {
+      const optA = document.createElement("option");
+      optA.value = lang.code;
+      optA.textContent = `${lang.name} (${lang.code})`;
+      sourceSelect.appendChild(optA);
+
+      const optB = document.createElement("option");
+      optB.value = lang.code;
+      optB.textContent = `${lang.name} (${lang.code})`;
+      targetSelect.appendChild(optB);
+    }
+    sourceSelect.value = "zh";
+    targetSelect.value = "en";
+
+    function langDisplayName(code) {
+      return SUPPORTED_LANGUAGES.find((x) => x.code === code)?.name || code;
+    }
+
+    function updatePaneTitles() {
+      const src = sourceSelect.value;
+      const tgt = targetSelect.value;
+      sourcePaneTitle.textContent = `录入原文 (${langDisplayName(src)})`;
+      targetPaneTitle.textContent =
+        src === tgt ? `同步成稿 (${langDisplayName(tgt)})` : `实时翻译 (${langDisplayName(src)} → ${langDisplayName(tgt)})`;
+    }
+    updatePaneTitles();
+
     const session = createSession({
       summaryModelPath: gemmaWebFile,
-      asrModelPath: "asr-model",
+      asrModelPath: "/models/asr-zh",
+      sourceLang: sourceSelect.value,
+      targetLang: targetSelect.value,
+      translationIntervalMs: 3000,
       sherpaUrl: "/assets/apexo/sherpa/",
+      ortUrl: "/assets/apexo/ort/",
       litertWasmUrl: "/assets/apexo/litert/",
       webSummary: true,
-      onChange: () => paint(), // events from the recognizer worker arrive after pushPcm has returned
+      onChange: () => paint(),
     });
 
     let loadErrorReason = "";
-    try {
-      await session.loadRecognizer();
-    } catch (err) {
-      // A present model that fails to load stays failed. Recording does not silently switch to cloud ASR.
-      loadErrorReason = String(err?.message || err || "unknown error");
-    }
+    let transErrorReason = "";
+    let currentPackStatus = null;
+    let downloadingPacks = false;
 
     function updateEngineNotice() {
-      if (session.recognizerState === "live") {
-        engineLabel.textContent = "转写引擎：本机 sherpa-onnx，音频不离开浏览器。";
-      } else if (browserAsrCheckbox.checked) {
-        engineLabel.textContent = "转写引擎：已手动启用浏览器自带识别，浏览器可能把音频发到云端在线服务。";
-      } else if (session.recognizerState === "failed") {
-        engineLabel.textContent = `转写引擎：本机识别器加载失败（${loadErrorReason}）。默认不启用浏览器云端识别；如需临时使用请勾选下方选项。`;
+      const asrNote =
+        session.recognizerState === "live"
+          ? `本机 sherpa-onnx (${sourceSelect.value})，音频不离开浏览器`
+          : browserAsrCheckbox.checked
+            ? "已手动启用浏览器自带识别，浏览器可能把音频发到云端在线服务"
+            : session.recognizerState === "failed"
+              ? `本机识别器加载失败（${loadErrorReason}）。默认不启用浏览器云端识别；如需临时使用请勾选下方选项`
+              : "未检测到本地模型（可点击上方“下载所需语言包”一键下载）。默认不启用浏览器云端识别；如需临时使用请勾选下方选项";
+
+      let transNote = "";
+      if (sourceSelect.value === targetSelect.value) {
+        transNote = `；同语言 (${targetSelect.value}) 无需翻译模型`;
+      } else if (session.translatorState === "live") {
+        transNote = `；离线翻译引擎已就绪 (${sourceSelect.value} → ${targetSelect.value})`;
+      } else if (session.translatorState === "failed") {
+        transNote = `；离线翻译引擎加载失败（${transErrorReason}）`;
       } else {
-        engineLabel.textContent = "转写引擎：未检测到本地模型（请把 encoder.onnx、decoder.onnx、joiner.onnx、tokens.txt 放进 asr-model 目录）。默认不启用浏览器云端识别；如需临时使用请勾选下方选项。";
+        transNote = `；离线翻译包未就绪（请点击“下载所需语言包”）`;
+      }
+      engineLabel.textContent = `转写引擎：${asrNote}${transNote}。`;
+    }
+
+    function renderPackStatus(info) {
+      currentPackStatus = info;
+      const parts = [];
+      let missingCount = 0;
+      if (info.asr) {
+        if (!info.asr.ready) missingCount += 1;
+        parts.push(
+          `${info.asr.title} (~${info.asr.sizeMB} MB) <span class="${info.asr.ready ? "badge-ok" : "badge-miss"}">${
+            info.asr.ready ? "已就绪" : "待下载"
+          }</span>`,
+        );
+      }
+      if (info.translationMode === "passthrough") {
+        parts.push(`同语言直通 <span class="badge-ok">无需翻译包</span>`);
+      } else if (info.translation.length > 0) {
+        for (const pack of info.translation) {
+          if (!pack.ready) missingCount += 1;
+          parts.push(
+            `${pack.title} (~${pack.sizeMB} MB) <span class="${pack.ready ? "badge-ok" : "badge-miss"}">${
+              pack.ready ? "已就绪" : "待下载"
+            }</span>`,
+          );
+        }
+      }
+      packStatusEl.innerHTML = parts.join(" ｜ ");
+      downloadPacksBtn.disabled = downloadingPacks || missingCount === 0;
+      downloadPacksBtn.textContent = downloadingPacks
+        ? "正在加载语言包…"
+        : missingCount === 0
+          ? "所需语言包已就绪"
+          : `下载所需语言包 (${missingCount})`;
+
+      if (info.summary?.ready && downloadButton.textContent === "下载 Gemma 4 E2B") {
+        downloadButton.textContent = "Gemma 4 E2B 已就绪";
+        gemmaProgress.textContent = "检测到本地 Gemma 4 E2B 模型已就绪，可直接生成目标语言阶段摘要或总结。";
       }
     }
-    updateEngineNotice();
-    (async () => {
-      try {
-        if (await probeAsrFile(gemmaWebFile)) {
-          downloadButton.textContent = "Gemma 4 E2B 已就绪";
-          gemmaProgress.textContent = "检测到本地 Gemma 4 E2B 模型已就绪，可直接生成阶段摘要或总结。";
+
+    async function syncLanguageModels() {
+      const src = sourceSelect.value;
+      const tgt = targetSelect.value;
+      updatePaneTitles();
+      session.setLanguages(src, tgt);
+      loadErrorReason = "";
+      transErrorReason = "";
+
+      const res = await fetch(`/api/packs/status?source=${encodeURIComponent(src)}&target=${encodeURIComponent(tgt)}`);
+      const info = await res.json();
+      renderPackStatus(info);
+
+      const nextAsrUrl = info.asr?.url || `/models/asr-${src}`;
+      session.setAsrModelPath(nextAsrUrl);
+      if (info.asr?.ready) {
+        try {
+          await session.loadRecognizer();
+        } catch (err) {
+          loadErrorReason = String(err?.message || err || "unknown error");
         }
-      } catch {}
-    })();
-    browserAsrCheckbox.addEventListener("change", () => {
+      }
+
+      const transUrls = (info.translation || []).map((t) => t.url);
+      await session.setTranslationModelPaths(transUrls);
+      if (info.translationMode === "passthrough" || (transUrls.length > 0 && info.translation.every((t) => t.ready))) {
+        try {
+          await session.loadTranslator();
+        } catch (err) {
+          transErrorReason = String(err?.message || err || "unknown error");
+        }
+      }
       updateEngineNotice();
-      if (recording) {
-        if (browserAsrCheckbox.checked) startRecognition();
-        else stopRecognition();
+      paint();
+    }
+
+    await syncLanguageModels();
+
+    async function downloadSinglePack(kind, id, label) {
+      const response = await fetch(`/api/packs/download?kind=${encodeURIComponent(kind)}&id=${encodeURIComponent(id)}`);
+      if (!response.ok || !response.body) {
+        throw new Error(`下载请求失败 (${response.status})`);
+      }
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let buffer = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const ev = JSON.parse(line);
+          if (ev.stage === "error") {
+            throw new Error(ev.error || `${label} 下载失败`);
+          }
+          if (ev.stage === "extracting") {
+            packProgressEl.textContent = `正在解压 ${label}…`;
+          } else if (ev.stage === "downloading") {
+            const pct = typeof ev.percent === "number" ? ` ${ev.percent}%` : "";
+            const fileHint = ev.file ? ` (${ev.file})` : "";
+            packProgressEl.textContent = `正在下载 ${label}${fileHint}${pct}…`;
+          }
+        }
+      }
+      if (buffer.trim()) {
+        const ev = JSON.parse(buffer);
+        if (ev.stage === "error") throw new Error(ev.error || `${label} 下载失败`);
+      }
+    }
+
+    downloadPacksBtn.addEventListener("click", async () => {
+      if (downloadingPacks || !currentPackStatus) return;
+      const queue = [];
+      if (currentPackStatus.asr && !currentPackStatus.asr.ready) {
+        queue.push({ kind: "asr", id: currentPackStatus.asr.id, title: currentPackStatus.asr.title });
+      }
+      for (const t of currentPackStatus.translation || []) {
+        if (!t.ready) {
+          queue.push({ kind: "trans", id: t.id, title: t.title });
+        }
+      }
+      if (queue.length === 0) return;
+
+      downloadingPacks = true;
+      downloadPacksBtn.disabled = true;
+      sourceSelect.disabled = true;
+      targetSelect.disabled = true;
+      swapBtn.disabled = true;
+      try {
+        for (let i = 0; i < queue.length; i += 1) {
+          const item = queue[i];
+          packProgressEl.textContent = `[${i + 1}/${queue.length}] 准备下载 ${item.title}…`;
+          await downloadSinglePack(item.kind, item.id, item.title);
+        }
+        packProgressEl.textContent = "语言包已下载，正在启动本地识别与离线翻译引擎…";
+        await syncLanguageModels();
+        packProgressEl.textContent = "所需语言包已全部就绪，现在可以开始录音实时翻译！";
+      } catch (err) {
+        packProgressEl.textContent = `语言包下载失败：${err?.message || err}`;
+      } finally {
+        downloadingPacks = false;
+        sourceSelect.disabled = false;
+        targetSelect.disabled = false;
+        swapBtn.disabled = false;
+        if (currentPackStatus) renderPackStatus(currentPackStatus);
+        updateEngineNotice();
       }
     });
 
@@ -123,8 +350,64 @@
     let committed = "";
     let recognitionBlocked = false;
 
+    async function handleLanguageSelectionChange() {
+      if (recording) await finishRecording();
+      session.reset();
+      summaryPanel.style.display = "none";
+      summaryPanel.textContent = "";
+      packProgressEl.textContent = "";
+      await syncLanguageModels();
+    }
+
+    sourceSelect.addEventListener("change", () => {
+      handleLanguageSelectionChange();
+    });
+    targetSelect.addEventListener("change", () => {
+      handleLanguageSelectionChange();
+    });
+    swapBtn.addEventListener("click", () => {
+      const prevSrc = sourceSelect.value;
+      sourceSelect.value = targetSelect.value;
+      targetSelect.value = prevSrc;
+      handleLanguageSelectionChange();
+    });
+
+    browserAsrCheckbox.addEventListener("change", () => {
+      updateEngineNotice();
+      if (recording) {
+        if (browserAsrCheckbox.checked) startRecognition();
+        else stopRecognition();
+      }
+    });
+
     function paint() {
       transcript.textContent = session.displayText;
+      translationBox.textContent = session.translatedDisplayText;
+      if (session.sourceLang === session.targetLang) {
+        translationStatus.textContent = "同语言同步显示，无需翻译。";
+      } else if (session.translatorState !== "live") {
+        translationStatus.textContent = session.translatorState === "failed"
+          ? `翻译引擎加载失败：${transErrorReason || "请重新加载语言包"}`
+          : "翻译包未就绪，请先下载所需语言包。";
+      } else if (session.translationPending) {
+        translationStatus.textContent = "正在翻译，完成后自动更新…";
+      } else if (session.translationError) {
+        translationStatus.textContent = `翻译失败：${session.translationError}`;
+      } else if (session.translationPreviewText) {
+        translationStatus.textContent = "末行为翻译预览，句子定稿后会自动校正；每 3 秒更新有变化的内容。";
+      } else {
+        translationStatus.textContent = "每 3 秒更新翻译预览，句子定稿后确认完整译文。";
+      }
+    }
+
+    function showSummary(heading, body) {
+      if (!body) {
+        summaryPanel.style.display = "none";
+        summaryPanel.textContent = "";
+        return;
+      }
+      summaryPanel.style.display = "block";
+      summaryPanel.textContent = `${heading} (${langDisplayName(targetSelect.value)})\n${body}`;
     }
 
     function clock() {
@@ -168,7 +451,7 @@
       committed = "";
       const next = new Speech();
       recognition = next;
-      next.lang = "zh-CN";
+      next.lang = speechRecognitionLangFor(sourceSelect.value);
       next.continuous = true;
       next.interimResults = true;
       next.onresult = (event) => {
@@ -210,6 +493,7 @@
     async function startRecording() {
       if (recording) return;
       session.reset();
+      showSummary("", "");
       paint();
       media = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -335,9 +619,11 @@
       try {
         const stageSummary = await session.summarizeNew();
         const currentSpoken = session.fullTranscript || spoken;
-        transcript.textContent = stageSummary
-          ? `${currentSpoken}\n\n阶段摘要\n${stageSummary}`
-          : currentSpoken;
+        transcript.textContent = currentSpoken;
+        if (session.fullTranslation) {
+          translationBox.textContent = session.fullTranslation;
+        }
+        showSummary("阶段摘要", stageSummary);
         status.textContent = recording ? "录音中（阶段摘要已更新）" : "阶段摘要完成";
       } catch (err) {
         const currentSpoken = session.fullTranscript || spoken;
@@ -363,7 +649,11 @@
       status.textContent = "正在总结";
       try {
         const summary = await session.summarize();
-        transcript.textContent = `${spoken}\n\n总结\n${summary}`;
+        transcript.textContent = spoken;
+        if (session.fullTranslation) {
+          translationBox.textContent = session.fullTranslation;
+        }
+        showSummary("总结", summary);
         status.textContent = session.gemmaResident ? "Gemma 仍驻留" : "总结完成";
       } catch (err) {
         transcript.textContent = spoken;
@@ -412,11 +702,13 @@
     document.querySelector("#feed-test-audio").addEventListener("click", async () => {
       if (recording) return;
       session.reset();
+      showSummary("", "");
       paint();
       status.textContent = "正在加载测试音频...";
       try {
-        const res = await fetch("/test.wav");
-        if (!res.ok) throw new Error("test.wav not found");
+        const wavUrl = currentPackStatus?.asr?.sampleWavUrl || "/test.wav";
+        const res = await fetch(wavUrl);
+        if (!res.ok) throw new Error("未找到当前语言的测试音频（请先下载对应语言识别包）");
         const arrayBuf = await res.arrayBuffer();
         if (!audioContext || audioContext.state === "closed") {
           audioContext = new AudioContext({ sampleRate: 16000 });
@@ -427,7 +719,7 @@
         segmentSamples = [pcm];
         lastSegment = pcm;
         lastRate = decoded.sampleRate;
-        status.textContent = "正在识别测试音频...";
+        status.textContent = "正在识别并实时翻译测试音频...";
         const chunkSize = 1600;
         for (let i = 0; i < pcm.length; i += chunkSize) {
           const chunk = pcm.subarray(i, Math.min(i + chunkSize, pcm.length));
@@ -438,7 +730,7 @@
         await session.drain();
         await session.endSegment();
         paint();
-        status.textContent = "测试音频识别完成，可以点击阶段摘要或总结。";
+        status.textContent = "测试音频识别与实时翻译完成，可以点击阶段摘要或总结。";
       } catch (err) {
         status.textContent = `测试音频识别失败：${err.message || err}`;
       }
@@ -454,7 +746,7 @@
         externalSummary.textContent = "请先在上方输入需要总结的文本。";
         return;
       }
-      externalSummary.textContent = "正在生成外部文本总结...";
+      externalSummary.textContent = `正在以 ${langDisplayName(targetSelect.value)} 生成外部文本总结...`;
       try {
         const result = await session.summarize(text);
         externalSummary.textContent = result || "（无总结结果）";

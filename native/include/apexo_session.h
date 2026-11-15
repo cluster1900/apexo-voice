@@ -48,6 +48,8 @@ typedef struct ApexoEngines {
   int (*sum_unload)(void* user);
   int (*sum_generate)(void* user, const char* prompt, char* out, int32_t out_cap);
   int (*asr_finish)(void* user, ApexoAsrEvent* out);
+  void* trans_user;
+  int (*trans_translate)(void* user, const char* text, char* out, int32_t out_cap);
 } ApexoEngines;
 
 typedef struct ApexoConfig {
@@ -58,18 +60,30 @@ typedef struct ApexoConfig {
   int32_t web_summary; /* 1: the model is supplied by a browser runtime, so a model name is required (a path
                         * that is only a label is fine). 0: native; an empty path is reported by summarize as -3.
                         * Either way a non-empty path must end in .litertlm. */
+  const char* source_lang;
+  const char* target_lang;
 } ApexoConfig;
 
 APEXO_API ApexoSession* apexo_session_create(const ApexoConfig* config, const ApexoEngines* engines);
 APEXO_API void apexo_session_destroy(ApexoSession* session);
 APEXO_API void apexo_session_set_transcript_callback(ApexoSession* session, ApexoTranscriptCallback callback,
                                                      void* user);
+APEXO_API void apexo_session_set_translation_callback(ApexoSession* session, ApexoTranscriptCallback callback,
+                                                      void* user);
+APEXO_API void apexo_session_set_languages(ApexoSession* session, const char* source_lang, const char* target_lang);
+APEXO_API const char* apexo_session_source_lang(const ApexoSession* session);
+APEXO_API const char* apexo_session_target_lang(const ApexoSession* session);
 APEXO_API int apexo_session_push_pcm(ApexoSession* session, const float* pcm, int32_t count, int32_t sample_rate);
 APEXO_API int apexo_session_end_segment(ApexoSession* session);
 APEXO_API int apexo_session_gemma_resident(const ApexoSession* session);
 APEXO_API const char* apexo_session_display_text(const ApexoSession* session);
 APEXO_API const char* apexo_session_full_transcript(const ApexoSession* session);
+APEXO_API const char* apexo_session_translated_display_text(const ApexoSession* session);
+APEXO_API const char* apexo_session_full_translation(const ApexoSession* session);
 APEXO_API const char* apexo_session_summary_text(const ApexoSession* session);
+/* Translates caller-supplied UTF-8 text from source_lang to target_lang without modifying session transcripts.
+ * When source_lang and target_lang match (and are non-empty), copies text out directly without loading a model. */
+APEXO_API int apexo_session_translate_text(ApexoSession* session, const char* text, char* out, int32_t out_cap);
 /* Summarizes the snapshot of finalized transcript (full_transcript) without modifying interim text, ASR state,
  * or blocking push_pcm. Replaces summary_text and advances the incremental cursor to the snapshot end. */
 APEXO_API int apexo_session_summarize(ApexoSession* session, char* out, int32_t out_cap);
@@ -105,6 +119,13 @@ APEXO_API void apexo_engine_state_destroy(void* state);
  * binary (for example <app>/Frameworks/sherpa-onnx.framework/sherpa-onnx). Ignored when the library was built with
  * -DAPEXO_STATIC_ENGINES, which links the engines into the host program instead. */
 APEXO_API void apexo_engine_state_set_libraries(void* state, const char* sherpa_library, const char* litert_library);
+APEXO_API void apexo_engine_state_set_ort_library(void* state, const char* ort_library);
+APEXO_API void apexo_engine_state_set_asr_model_dir(void* state, const char* asr_model_dir);
+/* Configures offline MarianMT/OPUS-MT ONNX translation model directory (holding config.json, vocab.json,
+ * source.spm, encoder_model.onnx, decoder_model.onnx). Pass pivot_model_dir when translating via a two-hop
+ * pivot (for example zh->en in model_dir and en->ja in pivot_model_dir), or NULL/"" for a direct pair. */
+APEXO_API void apexo_engine_state_set_translation_model_dirs(void* state, const char* model_dir,
+                                                             const char* pivot_model_dir);
 APEXO_API int apexo_engine_state_bind(void* state, ApexoEngines* out);
 
 #ifdef __cplusplus

@@ -177,20 +177,30 @@ EXPORTS
   apexo_session_create
   apexo_session_destroy
   apexo_session_set_transcript_callback
+  apexo_session_set_translation_callback
+  apexo_session_set_languages
+  apexo_session_source_lang
+  apexo_session_target_lang
   apexo_session_push_pcm
   apexo_session_end_segment
   apexo_session_summarize
   apexo_session_summarize_new
   apexo_session_summarize_text
+  apexo_session_translate_text
   apexo_session_reset
   apexo_session_release
   apexo_session_display_text
   apexo_session_full_transcript
+  apexo_session_translated_display_text
+  apexo_session_full_translation
   apexo_session_summary_text
   apexo_session_gemma_resident
   apexo_session_last_error
   apexo_engine_state_create
   apexo_engine_state_set_libraries
+  apexo_engine_state_set_ort_library
+  apexo_engine_state_set_asr_model_dir
+  apexo_engine_state_set_translation_model_dirs
   apexo_engine_state_bind
   apexo_engine_state_destroy
 EOF

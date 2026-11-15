@@ -20,6 +20,7 @@
   },
   "dependencies": {
     "@litert-lm/core": "0.19.0",
+    "onnxruntime-web": "^1.31.1",
     "sherpa-onnx": "2.0.1"
   },
   "license": "MIT",

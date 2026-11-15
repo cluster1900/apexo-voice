@@ -321,6 +321,96 @@ bool read_wav_16k_mono(const char* path, std::vector<float>* out_pcm) {
   return false;
 }
 
+void test_windows_translation_contracts() {
+  struct WinTransCtx {
+    int trans_calls = 0;
+    std::string last_prompt;
+    int loaded = 0;
+  } ctx;
+  ApexoEngines engines{};
+  engines.asr_user = &ctx;
+  engines.asr_push = [](void*, const float*, int32_t, int32_t, ApexoAsrEvent* out) -> int {
+    std::memset(out, 0, sizeof(*out));
+    std::snprintf(out->text, sizeof(out->text), "中文输入语句");
+    out->is_final = 1;
+    out->start_ms = 0;
+    out->end_ms = 500;
+    return 0;
+  };
+  engines.trans_user = &ctx;
+  engines.trans_translate = [](void* u, const char* text, char* out, int32_t cap) -> int {
+    auto* c = static_cast<WinTransCtx*>(u);
+    c->trans_calls += 1;
+    const std::string t = std::string("Translated: ") + (text ? text : "");
+    if (static_cast<int32_t>(t.size()) >= cap) return -1;
+    std::memcpy(out, t.c_str(), t.size() + 1);
+    return 0;
+  };
+  engines.sum_user = &ctx;
+  engines.sum_is_loaded = [](void* u) -> int { return static_cast<WinTransCtx*>(u)->loaded; };
+  engines.sum_load = [](void* u, const char*) -> int {
+    static_cast<WinTransCtx*>(u)->loaded = 1;
+    return 0;
+  };
+  engines.sum_unload = [](void* u) -> int {
+    static_cast<WinTransCtx*>(u)->loaded = 0;
+    return 0;
+  };
+  engines.sum_generate = [](void* u, const char* prompt, char* out, int32_t cap) -> int {
+    static_cast<WinTransCtx*>(u)->last_prompt = prompt ? prompt : "";
+    const char* s = "Summary: English meeting summary.";
+    if (static_cast<int32_t>(std::strlen(s)) >= cap) return -1;
+    std::strcpy(out, s);
+    return 0;
+  };
+
+  ApexoConfig cfg{};
+  cfg.merge_gap_ms = APEXO_MERGE_GAP_MS;
+  cfg.summary_chunk_chars = APEXO_SUMMARY_CHUNK_CHARS;
+  cfg.display_lines = APEXO_DISPLAY_LINES;
+  cfg.summary_model_path = "C:\\models\\gemma-4-E2B-it.litertlm";
+  cfg.source_lang = "zh-CN";
+  cfg.target_lang = "en-US";
+
+  ApexoSession* s = apexo_session_create(&cfg, &engines);
+  int trans_events = 0;
+  apexo_session_set_translation_callback(
+      s, [](void* u, const ApexoAsrEvent*) { *static_cast<int*>(u) += 1; }, &trans_events);
+
+  float sample = 0.1f;
+  check(apexo_session_push_pcm(s, &sample, 1, APEXO_SAMPLE_RATE) == 0, "Win translation: push_pcm returns 0");
+  check(std::strcmp(apexo_session_source_lang(s), "zh") == 0 && std::strcmp(apexo_session_target_lang(s), "en") == 0,
+        "Win translation: source_lang and target_lang normalized");
+  check(trans_events == 1 &&
+            std::strcmp(apexo_session_translated_display_text(s), "Translated: 中文输入语句") == 0 &&
+            std::strcmp(apexo_session_full_translation(s), "Translated: 中文输入语句") == 0,
+        "Win translation: real-time translation callback and views populated");
+
+  char sum_out[256] = {0};
+  check(apexo_session_summarize(s, sum_out, sizeof(sum_out)) == 0 &&
+            std::strcmp(sum_out, "English meeting summary.") == 0 &&
+            ctx.last_prompt.find("strictly in English") != std::string::npos,
+        "Win translation: summarize outputs in target language B");
+
+  char direct_out[256] = {0};
+  check(apexo_session_translate_text(s, "测试", direct_out, sizeof(direct_out)) == 0 &&
+            std::strcmp(direct_out, "Translated: 测试") == 0,
+        "Win translation: apexo_session_translate_text succeeds");
+
+  apexo_session_set_languages(s, "en", "en");
+  check(apexo_session_translate_text(s, "passthrough", direct_out, sizeof(direct_out)) == 0 &&
+            std::strcmp(direct_out, "passthrough") == 0,
+        "Win translation: same-language passthrough works");
+
+  apexo_session_destroy(s);
+
+  void* st = apexo_engine_state_create("", "");
+  apexo_engine_state_set_ort_library(st, "");
+  apexo_engine_state_set_asr_model_dir(st, "");
+  apexo_engine_state_set_translation_model_dirs(st, "", "");
+  apexo_engine_state_destroy(st);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -348,6 +438,7 @@ int main(int argc, char** argv) {
 #endif
   test_windows_core_contracts();
   test_windows_concurrency_and_busy();
+  test_windows_translation_contracts();
 
   if (argc >= 4) {
     /* Optional real-model run on Windows x64 (tests both sherpa-onnx ASR and LiteRT-LM Gemma). */

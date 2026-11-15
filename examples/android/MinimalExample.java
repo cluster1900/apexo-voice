@@ -141,6 +141,31 @@ public final class MinimalExample implements AutoCloseable {
     return summaryExecutor.submit(() -> session.summarize(externalText));
   }
 
+  /**
+   * Configures source language A -> target language B real-time translation and B-language summarization.
+   */
+  public void configureTranslation(
+      String sourceLang,
+      String targetLang,
+      String asrModelDir,
+      String transModelDir,
+      String pivotModelDir,
+      ApexoSession.TranscriptListener onTranslation) {
+    audioExecutor.execute(
+        () -> {
+          session.setLanguages(sourceLang, targetLang);
+          if (asrModelDir != null) {
+            session.setAsrModelDir(asrModelDir);
+          }
+          session.setTranslationModelDirs(transModelDir, pivotModelDir);
+          session.setTranslationListener(onTranslation);
+        });
+  }
+
+  public Future<String> translateTextAsync(String text) {
+    return summaryExecutor.submit(() -> session.translate(text));
+  }
+
   public void resetAsync() {
     audioExecutor.execute(session::reset);
   }

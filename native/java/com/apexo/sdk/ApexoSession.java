@@ -28,6 +28,7 @@ public final class ApexoSession implements AutoCloseable {
 
   private long handle;
   private volatile TranscriptListener transcriptListener;
+  private volatile TranscriptListener translationListener;
 
   /**
    * @param asrModelDir directory holding encoder.onnx, decoder.onnx, joiner.onnx and tokens.txt, or null/empty for
@@ -38,6 +39,28 @@ public final class ApexoSession implements AutoCloseable {
    */
   public ApexoSession(String asrModelDir, String summaryModelPath) {
     handle = nativeCreate(asrModelDir, summaryModelPath);
+    if (handle == 0) {
+      throw new IllegalStateException("apexo_session_create failed");
+    }
+  }
+
+  /**
+   * Creates a multilingual transcription + real-time translation + target-language summarization session.
+   *
+   * @param asrModelDir directory holding source-language streaming ASR ONNX files (or null/empty).
+   * @param translationModelDir directory holding MarianMT ONNX translation files (or null/empty; for 2-hop pivot use
+   *     {@link #setTranslationModelDirs(String, String)}).
+   * @param summaryModelPath Gemma 4 E2B .litertlm file.
+   * @param sourceLang source language code (e.g. "zh", "en", "ja", "ko", "fr", "de", "es", "ru").
+   * @param targetLang target language code for real-time translation and summary output.
+   */
+  public ApexoSession(
+      String asrModelDir,
+      String translationModelDir,
+      String summaryModelPath,
+      String sourceLang,
+      String targetLang) {
+    handle = nativeCreateWithLanguages(asrModelDir, translationModelDir, summaryModelPath, sourceLang, targetLang);
     if (handle == 0) {
       throw new IllegalStateException("apexo_session_create failed");
     }
@@ -81,6 +104,60 @@ public final class ApexoSession implements AutoCloseable {
     }
   }
 
+  public void setOrtLibrary(String ortLibrary) {
+    long h = enter();
+    try {
+      nativeSetOrtLibrary(h, ortLibrary);
+    } finally {
+      exit();
+    }
+  }
+
+  public void setAsrModelDir(String asrModelDir) {
+    long h = enter();
+    try {
+      nativeSetAsrModelDir(h, asrModelDir);
+    } finally {
+      exit();
+    }
+  }
+
+  public void setTranslationModelDirs(String modelDir, String pivotModelDir) {
+    long h = enter();
+    try {
+      nativeSetTranslationModelDirs(h, modelDir, pivotModelDir);
+    } finally {
+      exit();
+    }
+  }
+
+  public void setLanguages(String sourceLang, String targetLang) {
+    long h = enter();
+    try {
+      nativeSetLanguages(h, sourceLang, targetLang);
+    } finally {
+      exit();
+    }
+  }
+
+  public String sourceLang() {
+    long h = enter();
+    try {
+      return nativeSourceLang(h);
+    } finally {
+      exit();
+    }
+  }
+
+  public String targetLang() {
+    long h = enter();
+    try {
+      return nativeTargetLang(h);
+    } finally {
+      exit();
+    }
+  }
+
   public void setTranscriptListener(TranscriptListener listener) {
     long h = enter();
     try {
@@ -91,10 +168,28 @@ public final class ApexoSession implements AutoCloseable {
     }
   }
 
+  public void setTranslationListener(TranscriptListener listener) {
+    long h = enter();
+    try {
+      this.translationListener = listener;
+      nativeSetTranslationCallback(h, listener != null ? this : null);
+    } finally {
+      exit();
+    }
+  }
+
   // Invoked from JNI on the caller thread outside the native session mutex.
   @SuppressWarnings("unused")
   private void dispatchTranscript(String text, boolean isFinal, int startMs, int endMs) {
     TranscriptListener listener = this.transcriptListener;
+    if (listener != null) {
+      listener.onTranscript(new TranscriptEvent(text, isFinal, startMs, endMs));
+    }
+  }
+
+  @SuppressWarnings("unused")
+  private void dispatchTranslation(String text, boolean isFinal, int startMs, int endMs) {
+    TranscriptListener listener = this.translationListener;
     if (listener != null) {
       listener.onTranscript(new TranscriptEvent(text, isFinal, startMs, endMs));
     }
@@ -214,6 +309,41 @@ public final class ApexoSession implements AutoCloseable {
     }
   }
 
+  public String translatedDisplayText() {
+    long h = enter();
+    try {
+      return nativeTranslatedDisplay(h);
+    } finally {
+      exit();
+    }
+  }
+
+  public String fullTranslation() {
+    long h = enter();
+    try {
+      return nativeFullTranslation(h);
+    } finally {
+      exit();
+    }
+  }
+
+  /**
+   * Translates {@code text} from {@link #sourceLang()} to {@link #targetLang()} without mutating session state.
+   */
+  public String translate(String text) {
+    long h = enter();
+    try {
+      int[] rc = new int[1];
+      String translated = nativeTranslateText(h, text, rc);
+      if (translated == null) {
+        throw summarizeException(h, rc[0]);
+      }
+      return translated;
+    } finally {
+      exit();
+    }
+  }
+
   public String lastError() {
     long h = enter();
     try {
@@ -263,6 +393,7 @@ public final class ApexoSession implements AutoCloseable {
         return;
       }
       this.transcriptListener = null;
+      this.translationListener = null;
       closing = true;
       if (active == 0) {
         toDestroy = handle;
@@ -276,11 +407,32 @@ public final class ApexoSession implements AutoCloseable {
 
   private static native long nativeCreate(String asrModelDir, String summaryModelPath);
 
+  private static native long nativeCreateWithLanguages(
+      String asrModelDir,
+      String translationModelDir,
+      String summaryModelPath,
+      String sourceLang,
+      String targetLang);
+
   private static native void nativeDestroy(long handle);
 
   private static native void nativeSetLibraries(long handle, String sherpaLibrary, String litertLibrary);
 
+  private static native void nativeSetOrtLibrary(long handle, String ortLibrary);
+
+  private static native void nativeSetAsrModelDir(long handle, String asrModelDir);
+
+  private static native void nativeSetTranslationModelDirs(long handle, String modelDir, String pivotModelDir);
+
+  private static native void nativeSetLanguages(long handle, String sourceLang, String targetLang);
+
+  private static native String nativeSourceLang(long handle);
+
+  private static native String nativeTargetLang(long handle);
+
   private static native void nativeSetTranscriptCallback(long handle, Object target);
+
+  private static native void nativeSetTranslationCallback(long handle, Object target);
 
   private static native int nativePushPcm(long handle, float[] pcm, int sampleRate);
 
@@ -299,6 +451,12 @@ public final class ApexoSession implements AutoCloseable {
   private static native String nativeDisplay(long handle);
 
   private static native String nativeFullTranscript(long handle);
+
+  private static native String nativeTranslatedDisplay(long handle);
+
+  private static native String nativeFullTranslation(long handle);
+
+  private static native String nativeTranslateText(long handle, String text, int[] rcOut);
 
   private static native int nativeGemmaResident(long handle);
 

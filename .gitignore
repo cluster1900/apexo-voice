@@ -5,4 +5,5 @@ dist/
 .DS_Store
 examples/macos/minimal_example
 web/demo/asr-model
+web/demo/models/
 web/demo/test.wav

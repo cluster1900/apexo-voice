@@ -1,9 +1,14 @@
 #include "apexo_session.h"
 
+#include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -14,6 +19,7 @@
 
 #define LITERT_LM_C_API_EXPORT
 #include "third_party/litert-lm/conversation.h"
+#include "third_party/onnxruntime/onnxruntime_c_api.h"
 #include "third_party/sherpa-onnx/c-api.h"
 
 namespace {
@@ -45,10 +51,12 @@ using SendMessageFn = decltype(&litert_lm_conversation_send_message);
 using JsonDeleteFn = decltype(&litert_lm_json_response_delete);
 using JsonGetFn = decltype(&litert_lm_json_response_get_string);
 
+using OrtGetApiBaseFn = decltype(&OrtGetApiBase);
+
 struct SherpaApi {
   void* library = nullptr;
-  bool bound = false;  // symbols resolved
-  bool ready = false;  // and all of them present
+  bool bound = false;
+  bool ready = false;
   CreateOnlineRecognizerFn create_recognizer = nullptr;
   DestroyOnlineRecognizerFn destroy_recognizer = nullptr;
   CreateOnlineStreamFn create_stream = nullptr;
@@ -78,12 +86,42 @@ struct LitertApi {
   JsonGetFn json_get = nullptr;
 };
 
+struct OrtRuntime {
+  void* library = nullptr;
+  bool bound = false;
+  bool ready = false;
+  const OrtApi* api = nullptr;
+  OrtEnv* env = nullptr;
+  OrtMemoryInfo* mem_info = nullptr;
+};
+
 enum class AsrMode { kUnknown, kMissing, kLive, kFailed };
+enum class TransMode { kUnknown, kMissing, kLive, kFailed };
+
+struct MarianHop {
+  std::string dir;
+  TransMode mode = TransMode::kUnknown;
+  int32_t decoder_start_token_id = 0;
+  int32_t eos_token_id = 0;
+  int32_t pad_token_id = -1;
+  int32_t unk_token_id = 1;
+  int32_t decoder_layers = 6;
+  int32_t decoder_heads = 8;
+  int32_t d_model = 512;
+  size_t max_piece_chars = 1;
+  std::unordered_map<std::string, float> spm_scores;
+  std::unordered_map<std::string, int32_t> piece_to_id;
+  std::vector<std::string> id_to_piece;
+  OrtSession* encoder = nullptr;
+  OrtSession* decoder = nullptr;
+  bool has_merged_cache = false;
+};
 
 struct EngineState {
   std::string asr_dir;
-  std::string sherpa_library;  // explicit path set by the host; empty means the default name or the env variable
+  std::string sherpa_library;
   std::string litert_library;
+  std::string ort_library;
   std::string tokens_path;
   std::string encoder_path;
   std::string decoder_path;
@@ -97,9 +135,12 @@ struct EngineState {
   LiteRtLmEngineSettings* settings = nullptr;
   LiteRtLmEngine* engine = nullptr;
   LiteRtLmConversation* conversation = nullptr;
-  int generated = 0;                // messages sent on the current conversation
-  int64_t utterance_start_ms = -1;  // start of the words being decoded, -1 when none
-  bool stream_has_audio = false;    // whether the current stream has received audio since last reset/finish
+  int generated = 0;
+  int64_t utterance_start_ms = -1;
+  bool stream_has_audio = false;
+  OrtRuntime ort;
+  MarianHop hop1;
+  MarianHop hop2;
 };
 
 #if defined(_WIN32)
@@ -119,8 +160,6 @@ std::wstring utf8_to_wide(const std::string& path) {
   return out;
 }
 
-/* Converts a wide path to UTF-8. Used for engines (such as sherpa-onnx v2.0.1 on Windows) that decode
- * narrow paths as UTF-8 -> wide strings internally. */
 bool wide_to_utf8(const std::wstring& wide, std::string* out) {
   if (wide.empty()) return false;
   const int needed = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, nullptr, 0, nullptr, nullptr);
@@ -137,8 +176,6 @@ bool normalize_utf8_path(const std::string& path, std::string* out) {
   return wide_to_utf8(wpath, out);
 }
 
-/* Converts a wide path to the ANSI code page. Fails instead of substituting characters that code page cannot
- * show, because a different path would silently point at a different (or no) file. */
 bool wide_to_acp(const std::wstring& wide, std::string* out) {
   BOOL used_default = FALSE;
   const int needed =
@@ -152,8 +189,6 @@ bool wide_to_acp(const std::wstring& wide, std::string* out) {
   return true;
 }
 
-/* The engines take narrow paths. Gives the path they can open, or false when none exists: the path does not
- * fit the ANSI code page and the volume has no 8.3 short name for it (ReFS never does, NTFS may not). */
 bool normalize_narrow_path(const std::string& path, std::string* out) {
   const std::wstring wpath = utf8_to_wide(path);
   if (wpath.empty()) return false;
@@ -172,7 +207,6 @@ bool normalize_narrow_path(const std::string& path, std::string* out) {
 }
 #endif
 
-#if !defined(APEXO_STATIC_ENGINES)
 #if defined(_WIN32)
 std::wstring self_module_dir() {
   HMODULE self = nullptr;
@@ -241,13 +275,7 @@ void* lookup(void* library, const char* name) {
 #endif
 }
 
-#endif
-
 void close_library(void* library) {
-  /* Engine runtimes (LiteRT-LM / XNNPACK / ONNX Runtime) register pthread_key / FLS destructors pointing into
-   * their own code segments without deleting the keys on engine destruction. Unmapping the shared library via
-   * dlclose/FreeLibrary causes worker threads to jump to unmapped memory during pthread_exit / thread detach.
-   * Model weights and engine instances are still freed by unload_gemma() and destroy_recognizer(). */
   (void)library;
 }
 
@@ -263,13 +291,42 @@ bool path_exists(const std::string& path) {
 #endif
 }
 
+bool read_file_bytes(const std::string& path, std::string* out) {
+  out->clear();
+  if (path.empty()) return false;
+#if defined(_WIN32)
+  const std::wstring wpath = utf8_to_wide(path);
+  if (wpath.empty()) return false;
+  FILE* fp = _wfopen(wpath.c_str(), L"rb");
+#else
+  FILE* fp = std::fopen(path.c_str(), "rb");
+#endif
+  if (fp == nullptr) return false;
+  if (std::fseek(fp, 0, SEEK_END) != 0) {
+    std::fclose(fp);
+    return false;
+  }
+  const long sz = std::ftell(fp);
+  if (sz < 0 || std::fseek(fp, 0, SEEK_SET) != 0) {
+    std::fclose(fp);
+    return false;
+  }
+  out->resize(static_cast<size_t>(sz));
+  if (sz > 0 && std::fread(&(*out)[0], 1, static_cast<size_t>(sz), fp) != static_cast<size_t>(sz)) {
+    std::fclose(fp);
+    out->clear();
+    return false;
+  }
+  std::fclose(fp);
+  return true;
+}
+
 std::string join_path(const std::string& dir, const char* name) {
   if (dir.empty()) return name;
   if (dir.back() == '/' || dir.back() == '\\') return dir + name;
   return dir + "/" + name;
 }
 
-#if !defined(APEXO_STATIC_ENGINES)
 void* open_first_available(const std::string& explicit_path, const char* env_key, const char* primary,
                            const char* secondary, const char* tertiary = nullptr) {
   if (!explicit_path.empty()) return open_library(explicit_path.c_str());
@@ -282,6 +339,7 @@ void* open_first_available(const std::string& explicit_path, const char* env_key
   return open_library(tertiary);
 }
 
+#if !defined(APEXO_STATIC_ENGINES)
 void* open_default_sherpa(const std::string& explicit_path) {
 #if defined(_WIN32)
   return open_first_available(explicit_path, "APEXO_SHERPA_LIBRARY", "sherpa-onnx-c-api.dll", "sherpa-onnx.dll");
@@ -311,8 +369,6 @@ void* open_default_litert(const std::string& explicit_path) {
 #define APEXO_BIND(api, field, type, symbol) ((api)->field = reinterpret_cast<type>(lookup((api)->library, #symbol)))
 #endif
 
-/* True when every function the adapter needs was found. A failure is not cached when the library could not be
- * opened (it may be installed later) but is when the library was opened and lacks symbols. */
 bool load_sherpa(SherpaApi* api, const std::string& explicit_path) {
   (void)explicit_path;
   if (api->bound) return api->ready;
@@ -362,6 +418,97 @@ bool load_litert(LitertApi* api, const std::string& explicit_path) {
   return api->ready;
 }
 
+bool load_ort(OrtRuntime* ort, const std::string& explicit_path) {
+  if (ort->bound) return ort->ready;
+  OrtGetApiBaseFn get_base = nullptr;
+  const char* env_val = std::getenv("APEXO_ORT_LIBRARY");
+  if (!explicit_path.empty()) {
+    ort->library = open_library(explicit_path.c_str());
+    if (ort->library == nullptr) return false;
+    get_base = reinterpret_cast<OrtGetApiBaseFn>(lookup(ort->library, "OrtGetApiBase"));
+  } else if (env_val != nullptr && env_val[0] != '\0') {
+    ort->library = open_library(env_val);
+    if (ort->library == nullptr) return false;
+    get_base = reinterpret_cast<OrtGetApiBaseFn>(lookup(ort->library, "OrtGetApiBase"));
+  } else {
+#if defined(_WIN32)
+    ort->library = open_first_available("", "APEXO_ORT_LIBRARY", "onnxruntime.dll", "sherpa-onnx-c-api.dll");
+#elif defined(__APPLE__)
+    ort->library = open_first_available("", "APEXO_ORT_LIBRARY", "libonnxruntime.dylib",
+                                        "@rpath/onnxruntime.framework/onnxruntime",
+                                        "@rpath/SherpaOnnxC.framework/SherpaOnnxC");
+#else
+    ort->library = open_first_available("", "APEXO_ORT_LIBRARY", "libonnxruntime.so", "libsherpa-onnx-c-api.so");
+#endif
+    if (ort->library != nullptr) {
+      get_base = reinterpret_cast<OrtGetApiBaseFn>(lookup(ort->library, "OrtGetApiBase"));
+    }
+#if !defined(_WIN32) && defined(RTLD_DEFAULT)
+    if (get_base == nullptr) {
+      get_base = reinterpret_cast<OrtGetApiBaseFn>(dlsym(RTLD_DEFAULT, "OrtGetApiBase"));
+    }
+#endif
+  }
+  if (get_base == nullptr) return false;
+  ort->bound = true;
+  const OrtApiBase* base = get_base();
+  if (base == nullptr || base->GetApi == nullptr) return false;
+  static const uint32_t kTryVersions[] = {17u, 16u, 15u, 14u};
+  for (uint32_t ver : kTryVersions) {
+    ort->api = base->GetApi(ver);
+    if (ort->api != nullptr) break;
+  }
+  if (ort->api == nullptr) return false;
+  OrtStatus* st = ort->api->CreateEnv(ORT_LOGGING_LEVEL_ERROR, "apexo", &ort->env);
+  if (st != nullptr) {
+    ort->api->ReleaseStatus(st);
+    ort->env = nullptr;
+    return false;
+  }
+  st = ort->api->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &ort->mem_info);
+  if (st != nullptr) {
+    ort->api->ReleaseStatus(st);
+    ort->api->ReleaseEnv(ort->env);
+    ort->env = nullptr;
+    ort->mem_info = nullptr;
+    return false;
+  }
+  ort->ready = true;
+  return true;
+}
+
+void unload_marian_hop(const OrtRuntime& ort, MarianHop* hop) {
+  if (hop->encoder != nullptr && ort.api != nullptr && ort.api->ReleaseSession != nullptr) {
+    ort.api->ReleaseSession(hop->encoder);
+  }
+  if (hop->decoder != nullptr && ort.api != nullptr && ort.api->ReleaseSession != nullptr) {
+    ort.api->ReleaseSession(hop->decoder);
+  }
+  hop->encoder = nullptr;
+  hop->decoder = nullptr;
+  hop->has_merged_cache = false;
+  hop->spm_scores.clear();
+  hop->piece_to_id.clear();
+  hop->id_to_piece.clear();
+  hop->max_piece_chars = 1;
+  hop->mode = TransMode::kUnknown;
+}
+
+void destroy_recognizer_state(EngineState* state) {
+  if (state->stream != nullptr && state->sherpa.destroy_stream != nullptr) {
+    state->sherpa.destroy_stream(state->stream);
+  }
+  state->stream = nullptr;
+  if (state->recognizer != nullptr && state->sherpa.destroy_recognizer != nullptr) {
+    state->sherpa.destroy_recognizer(state->recognizer);
+  }
+  state->recognizer = nullptr;
+  state->samples = 0;
+  state->utterance_start_ms = -1;
+  state->stream_has_audio = false;
+  state->asr_mode = AsrMode::kUnknown;
+}
+
 void unload_gemma(EngineState* state) {
   if (state->conversation != nullptr && state->litert.conversation_delete != nullptr) {
     state->litert.conversation_delete(state->conversation);
@@ -373,7 +520,6 @@ void unload_gemma(EngineState* state) {
   state->settings = nullptr;
 }
 
-/* Copies at most sizeof(out->text) - 1 bytes (trimmed of ASCII whitespace) and never cuts a UTF-8 character in half. */
 void copy_text(ApexoAsrEvent* out, const char* text) {
   if (text == nullptr) text = "";
   const auto is_space = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
@@ -391,13 +537,11 @@ void copy_text(ApexoAsrEvent* out, const char* text) {
 }
 
 bool asr_files_present(const EngineState* state) {
-  if (state->asr_dir.empty()) return false;  // no directory given; never fall back to the working directory
+  if (state->asr_dir.empty()) return false;
   return path_exists(state->tokens_path) && path_exists(state->encoder_path) && path_exists(state->decoder_path) &&
          path_exists(state->joiner_path);
 }
 
-/* 0: recognizer is live. -3: model files are not all there (checked again on every call, so a model that is
- * copied in later is picked up). -5: the files are there but the engine could not be built. */
 int ensure_asr(EngineState* state) {
   if (state->asr_mode == AsrMode::kLive) return 0;
   if (state->asr_mode == AsrMode::kFailed) return -5;
@@ -481,8 +625,6 @@ int asr_push(void* user, const float* pcm, int32_t count, int32_t sample_rate, A
   if (count > 0) state->stream_has_audio = true;
   state->samples += count;
   const int64_t chunk_end_ms = state->samples * 1000 / APEXO_SAMPLE_RATE;
-  /* Decode everything that is ready, so latency does not pile up behind large pushes. The bound only guards
-   * against a runaway loop. */
   for (int steps = 0; steps < 1024 && state->sherpa.is_ready(state->recognizer, state->stream); ++steps) {
     state->sherpa.decode(state->recognizer, state->stream);
   }
@@ -491,12 +633,10 @@ int asr_push(void* user, const float* pcm, int32_t count, int32_t sample_rate, A
   const int endpoint = state->sherpa.is_endpoint(state->recognizer, state->stream);
   if (result != nullptr) state->sherpa.destroy_result(result);
   const bool has_text = out->text[0] != '\0';
-  /* Times describe the words, not the audio chunk: an utterance starts at the first chunk that had text. */
   if (has_text && state->utterance_start_ms < 0) state->utterance_start_ms = chunk_start_ms;
   out->start_ms = static_cast<int32_t>(has_text ? state->utterance_start_ms : chunk_start_ms);
   out->end_ms = static_cast<int32_t>(chunk_end_ms);
   if (endpoint) {
-    /* Silence can end an "utterance" that never had words; that is not an event. */
     out->is_final = has_text ? 1 : -1;
     state->sherpa.reset_stream(state->recognizer, state->stream);
     state->utterance_start_ms = -1;
@@ -556,7 +696,6 @@ int sum_is_loaded(void* user) {
   return state != nullptr && state->engine != nullptr ? 1 : 0;
 }
 
-/* Builds a fresh conversation, so chunks of one transcript do not see each other as chat history. */
 int new_conversation(EngineState* state) {
   if (state->conversation != nullptr) state->litert.conversation_delete(state->conversation);
   state->conversation = nullptr;
@@ -567,7 +706,6 @@ int new_conversation(EngineState* state) {
   return 0;
 }
 
-/* -3: the model file is not there. -5: the file is there but LiteRT-LM could not load it. */
 int sum_load(void* user, const char* model_path) {
   EngineState* state = static_cast<EngineState*>(user);
   if (state == nullptr) return -1;
@@ -575,7 +713,7 @@ int sum_load(void* user, const char* model_path) {
   const char* path = model_path != nullptr ? model_path : "";
   if (!path_exists(path)) return -3;
   auto fail = [&]() {
-    unload_gemma(state);  // never leave half-built engine state (and its memory) behind
+    unload_gemma(state);
     return -5;
   };
   if (!load_litert(&state->litert, state->litert_library)) return fail();
@@ -723,7 +861,7 @@ bool parse_json_string(const char* start, std::string* out, const char** after =
           append_utf8(out, cp);
           break;
         }
-        default: out->push_back(*start); break;  // \" \\ \/
+        default: out->push_back(*start); break;
       }
       ++start;
       continue;
@@ -755,7 +893,7 @@ bool extract_response_text(const char* json, std::string* out) {
     const char* after_key = nullptr;
     if (!parse_json_string(p, &key, &after_key)) return false;
     p = skip_json_ws(after_key);
-    if (*p != ':') continue;  // string value (for example "type":"text"), not a field name
+    if (*p != ':') continue;
     p = skip_json_ws(p + 1);
     if ((key == "text" || key == "content") && *p == '"') {
       return parse_json_string(p, out);
@@ -788,6 +926,754 @@ int sum_generate(void* user, const char* prompt, char* out, int32_t out_cap) {
   return 0;
 }
 
+/* ==================== Offline MarianMT / OPUS-MT ONNX Translation ==================== */
+
+size_t count_utf8_chars(const std::string& s) {
+  size_t count = 0;
+  for (size_t i = 0; i < s.size();) {
+    unsigned char c = static_cast<unsigned char>(s[i]);
+    size_t len = (c & 0x80) == 0 ? 1 : ((c & 0xE0) == 0xC0 ? 2 : ((c & 0xF0) == 0xE0 ? 3 : 4));
+    if (i + len > s.size()) len = 1;
+    i += len;
+    ++count;
+  }
+  return count;
+}
+
+std::vector<std::string> split_utf8_chars(const std::string& s) {
+  std::vector<std::string> out;
+  for (size_t i = 0; i < s.size();) {
+    unsigned char c = static_cast<unsigned char>(s[i]);
+    size_t len = (c & 0x80) == 0 ? 1 : ((c & 0xE0) == 0xC0 ? 2 : ((c & 0xF0) == 0xE0 ? 3 : 4));
+    if (i + len > s.size()) len = 1;
+    out.push_back(s.substr(i, len));
+    i += len;
+  }
+  return out;
+}
+
+bool parse_json_int_field(const std::string& json, const char* field_name, int32_t* out_val) {
+  const char* p = json.c_str();
+  while (*p != '\0') {
+    if (*p != '"') {
+      ++p;
+      continue;
+    }
+    std::string key;
+    const char* after_key = nullptr;
+    if (!parse_json_string(p, &key, &after_key)) return false;
+    p = skip_json_ws(after_key);
+    if (*p != ':') continue;
+    p = skip_json_ws(p + 1);
+    if (key == field_name) {
+      if (*p == '-' || (*p >= '0' && *p <= '9')) {
+        char* endp = nullptr;
+        const long v = std::strtol(p, &endp, 10);
+        if (endp != p) {
+          *out_val = static_cast<int32_t>(v);
+          return true;
+        }
+      }
+      return false;
+    }
+  }
+  return false;
+}
+
+bool parse_marian_vocab(const std::string& json, MarianHop* hop) {
+  hop->piece_to_id.clear();
+  hop->id_to_piece.clear();
+  const char* p = skip_json_ws(json.c_str());
+  if (*p != '{') return false;
+  ++p;
+  int32_t max_id = -1;
+  std::vector<std::pair<std::string, int32_t>> entries;
+  while (*p != '\0') {
+    p = skip_json_ws(p);
+    if (*p == '}') break;
+    if (*p == ',') {
+      ++p;
+      continue;
+    }
+    if (*p != '"') return false;
+    std::string piece;
+    const char* after_piece = nullptr;
+    if (!parse_json_string(p, &piece, &after_piece)) return false;
+    p = skip_json_ws(after_piece);
+    if (*p != ':') return false;
+    p = skip_json_ws(p + 1);
+    char* endp = nullptr;
+    const long id = std::strtol(p, &endp, 10);
+    if (endp == p || id < 0 || id > 500000) return false;
+    p = endp;
+    const int32_t tid = static_cast<int32_t>(id);
+    entries.emplace_back(piece, tid);
+    if (tid > max_id) max_id = tid;
+  }
+  if (max_id < 0) return false;
+  hop->id_to_piece.assign(static_cast<size_t>(max_id + 1), std::string());
+  hop->piece_to_id.reserve(entries.size());
+  for (const auto& kv : entries) {
+    hop->piece_to_id[kv.first] = kv.second;
+    hop->id_to_piece[static_cast<size_t>(kv.second)] = kv.first;
+  }
+  const auto unk_it = hop->piece_to_id.find("<unk>");
+  if (unk_it != hop->piece_to_id.end()) hop->unk_token_id = unk_it->second;
+  return true;
+}
+
+bool read_proto_varint(const unsigned char* data, size_t size, size_t* pos, uint64_t* out) {
+  uint64_t result = 0;
+  int shift = 0;
+  while (*pos < size && shift < 64) {
+    const unsigned char b = data[(*pos)++];
+    result |= static_cast<uint64_t>(b & 0x7Fu) << shift;
+    if ((b & 0x80u) == 0) {
+      *out = result;
+      return true;
+    }
+    shift += 7;
+  }
+  return false;
+}
+
+bool parse_sentencepiece_spm(const std::string& bytes, MarianHop* hop) {
+  hop->spm_scores.clear();
+  hop->max_piece_chars = 1;
+  const unsigned char* data = reinterpret_cast<const unsigned char*>(bytes.data());
+  const size_t size = bytes.size();
+  size_t pos = 0;
+  while (pos < size) {
+    uint64_t tag = 0;
+    if (!read_proto_varint(data, size, &pos, &tag)) return false;
+    const uint32_t field = static_cast<uint32_t>(tag >> 3);
+    const uint32_t wire = static_cast<uint32_t>(tag & 7u);
+    if (wire == 2) {
+      uint64_t len = 0;
+      if (!read_proto_varint(data, size, &pos, &len) || pos + len > size) return false;
+      const size_t end = pos + static_cast<size_t>(len);
+      if (field == 1) {
+        std::string piece;
+        float score = 0.0f;
+        uint64_t type = 1;
+        while (pos < end) {
+          uint64_t stag = 0;
+          if (!read_proto_varint(data, end, &pos, &stag)) return false;
+          const uint32_t sfield = static_cast<uint32_t>(stag >> 3);
+          const uint32_t swire = static_cast<uint32_t>(stag & 7u);
+          if (sfield == 1 && swire == 2) {
+            uint64_t slen = 0;
+            if (!read_proto_varint(data, end, &pos, &slen) || pos + slen > end) return false;
+            piece.assign(reinterpret_cast<const char*>(data + pos), static_cast<size_t>(slen));
+            pos += static_cast<size_t>(slen);
+          } else if (sfield == 2 && swire == 5) {
+            if (pos + 4 > end) return false;
+            std::memcpy(&score, data + pos, 4);
+            pos += 4;
+          } else if (sfield == 3 && swire == 0) {
+            if (!read_proto_varint(data, end, &pos, &type)) return false;
+          } else if (swire == 0) {
+            uint64_t dummy = 0;
+            if (!read_proto_varint(data, end, &pos, &dummy)) return false;
+          } else if (swire == 2) {
+            uint64_t slen = 0;
+            if (!read_proto_varint(data, end, &pos, &slen) || pos + slen > end) return false;
+            pos += static_cast<size_t>(slen);
+          } else if (swire == 5) {
+            if (pos + 4 > end) return false;
+            pos += 4;
+          } else if (swire == 1) {
+            if (pos + 8 > end) return false;
+            pos += 8;
+          } else {
+            return false;
+          }
+        }
+        if (!piece.empty() && (type == 1 || type == 4)) {
+          hop->spm_scores[piece] = score;
+          const size_t ccount = count_utf8_chars(piece);
+          if (ccount > hop->max_piece_chars) hop->max_piece_chars = ccount;
+        }
+      } else {
+        pos = end;
+      }
+    } else if (wire == 0) {
+      uint64_t dummy = 0;
+      if (!read_proto_varint(data, size, &pos, &dummy)) return false;
+    } else if (wire == 5) {
+      if (pos + 4 > size) return false;
+      pos += 4;
+    } else if (wire == 1) {
+      if (pos + 8 > size) return false;
+      pos += 8;
+    } else {
+      return false;
+    }
+  }
+  return !hop->spm_scores.empty();
+}
+
+std::vector<int64_t> encode_marian_word(const MarianHop& hop, const std::string& word) {
+  static const char kMetaspace[] = "\xE2\x96\x81";
+  const std::vector<std::string> chars = split_utf8_chars(std::string(kMetaspace) + word);
+  const size_t n = chars.size();
+  const double kNegInf = -1e18;
+  std::vector<double> best_score(n + 1, kNegInf);
+  std::vector<size_t> best_prev(n + 1, 0);
+  std::vector<int32_t> best_id(n + 1, hop.unk_token_id);
+  best_score[0] = 0.0;
+  for (size_t i = 0; i < n; ++i) {
+    if (best_score[i] <= -1e17) continue;
+    const size_t max_j = (i + hop.max_piece_chars < n) ? (i + hop.max_piece_chars) : n;
+    std::string sub;
+    for (size_t j = i + 1; j <= max_j; ++j) {
+      sub += chars[j - 1];
+      const auto sc_it = hop.spm_scores.find(sub);
+      if (sc_it == hop.spm_scores.end()) continue;
+      const auto id_it = hop.piece_to_id.find(sub);
+      if (id_it == hop.piece_to_id.end()) continue;
+      const double cand = best_score[i] + static_cast<double>(sc_it->second);
+      if (cand > best_score[j]) {
+        best_score[j] = cand;
+        best_prev[j] = i;
+        best_id[j] = id_it->second;
+      }
+    }
+    if (best_score[i + 1] <= -1e17) {
+      const auto id_it = hop.piece_to_id.find(chars[i]);
+      best_score[i + 1] = best_score[i] - 100.0;
+      best_prev[i + 1] = i;
+      best_id[i + 1] = (id_it != hop.piece_to_id.end()) ? id_it->second : hop.unk_token_id;
+    }
+  }
+  std::vector<int64_t> rev;
+  for (size_t cur = n; cur > 0; cur = best_prev[cur]) {
+    rev.push_back(static_cast<int64_t>(best_id[cur]));
+  }
+  std::vector<int64_t> out(rev.rbegin(), rev.rend());
+  return out;
+}
+
+std::vector<int64_t> encode_marian_text(const MarianHop& hop, const std::string& text) {
+  std::vector<int64_t> ids;
+  size_t i = 0;
+  const auto is_ws = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
+  while (i < text.size()) {
+    while (i < text.size() && is_ws(text[i])) ++i;
+    if (i >= text.size()) break;
+    const size_t start = i;
+    while (i < text.size() && !is_ws(text[i])) ++i;
+    const std::vector<int64_t> w_ids = encode_marian_word(hop, text.substr(start, i - start));
+    ids.insert(ids.end(), w_ids.begin(), w_ids.end());
+    if (ids.size() >= 510) {
+      ids.resize(510);
+      break;
+    }
+  }
+  ids.push_back(static_cast<int64_t>(hop.eos_token_id));
+  return ids;
+}
+
+std::string decode_marian_tokens(const MarianHop& hop, const std::vector<int32_t>& tokens) {
+  std::string raw;
+  for (size_t i = 0; i < tokens.size(); ++i) {
+    const int32_t id = tokens[i];
+    if (i == 0 && id == hop.decoder_start_token_id) continue;
+    if (id == hop.eos_token_id || id == hop.pad_token_id) continue;
+    if (id >= 0 && static_cast<size_t>(id) < hop.id_to_piece.size()) {
+      raw += hop.id_to_piece[static_cast<size_t>(id)];
+    }
+  }
+  std::string out;
+  out.reserve(raw.size());
+  for (size_t i = 0; i < raw.size();) {
+    if (i + 3 <= raw.size() && static_cast<unsigned char>(raw[i]) == 0xE2 &&
+        static_cast<unsigned char>(raw[i + 1]) == 0x96 && static_cast<unsigned char>(raw[i + 2]) == 0x81) {
+      out.push_back(' ');
+      i += 3;
+    } else {
+      out.push_back(raw[i]);
+      ++i;
+    }
+  }
+  size_t start = 0;
+  while (start < out.size() && (out[start] == ' ' || out[start] == '\t')) ++start;
+  size_t end = out.size();
+  while (end > start && (out[end - 1] == ' ' || out[end - 1] == '\t')) --end;
+  return out.substr(start, end - start);
+}
+
+bool marian_files_present(const std::string& dir) {
+  if (dir.empty()) return false;
+  return path_exists(join_path(dir, "config.json")) && path_exists(join_path(dir, "vocab.json")) &&
+         path_exists(join_path(dir, "source.spm")) && path_exists(join_path(dir, "encoder_model.onnx")) &&
+         path_exists(join_path(dir, "decoder_model.onnx"));
+}
+
+OrtSession* create_ort_session(const OrtRuntime& ort, const std::string& model_path) {
+  OrtSessionOptions* opts = nullptr;
+  OrtStatus* st = ort.api->CreateSessionOptions(&opts);
+  if (st != nullptr || opts == nullptr) {
+    if (st != nullptr) ort.api->ReleaseStatus(st);
+    return nullptr;
+  }
+  st = ort.api->SetIntraOpNumThreads(opts, 2);
+  if (st != nullptr) ort.api->ReleaseStatus(st);
+  st = ort.api->SetSessionGraphOptimizationLevel(opts, ORT_ENABLE_ALL);
+  if (st != nullptr) ort.api->ReleaseStatus(st);
+
+  OrtSession* sess = nullptr;
+#if defined(_WIN32)
+  const std::wstring wpath = utf8_to_wide(model_path);
+  if (!wpath.empty()) {
+    st = ort.api->CreateSession(ort.env, wpath.c_str(), opts, &sess);
+    if (st != nullptr) {
+      ort.api->ReleaseStatus(st);
+      sess = nullptr;
+    }
+  }
+#else
+  st = ort.api->CreateSession(ort.env, model_path.c_str(), opts, &sess);
+  if (st != nullptr) {
+    ort.api->ReleaseStatus(st);
+    sess = nullptr;
+  }
+#endif
+  ort.api->ReleaseSessionOptions(opts);
+  return sess;
+}
+
+bool detect_merged_cache(const OrtRuntime& ort, OrtSession* decoder) {
+  size_t count = 0;
+  OrtStatus* st = ort.api->SessionGetInputCount(decoder, &count);
+  if (st != nullptr) {
+    ort.api->ReleaseStatus(st);
+    return false;
+  }
+  OrtAllocator* alloc = nullptr;
+  st = ort.api->GetAllocatorWithDefaultOptions(&alloc);
+  if (st != nullptr || alloc == nullptr) {
+    if (st != nullptr) ort.api->ReleaseStatus(st);
+    return false;
+  }
+  bool found = false;
+  for (size_t i = 0; i < count; ++i) {
+    char* name = nullptr;
+    st = ort.api->SessionGetInputName(decoder, i, alloc, &name);
+    if (st != nullptr) {
+      ort.api->ReleaseStatus(st);
+      continue;
+    }
+    if (name != nullptr) {
+      if (std::strcmp(name, "use_cache_branch") == 0) found = true;
+      st = ort.api->AllocatorFree(alloc, name);
+      if (st != nullptr) ort.api->ReleaseStatus(st);
+    }
+  }
+  return found;
+}
+
+int ensure_marian_hop(EngineState* state, MarianHop* hop) {
+  if (hop->mode == TransMode::kLive) return 0;
+  if (hop->mode == TransMode::kFailed) return -5;
+  if (!marian_files_present(hop->dir)) {
+    hop->mode = TransMode::kMissing;
+    return -3;
+  }
+  if (!load_ort(&state->ort, state->ort_library)) {
+    hop->mode = TransMode::kFailed;
+    return -5;
+  }
+  auto fail = [&]() {
+    unload_marian_hop(state->ort, hop);
+    hop->mode = TransMode::kFailed;
+    return -5;
+  };
+  std::string cfg_json, vocab_json, spm_bytes;
+  if (!read_file_bytes(join_path(hop->dir, "config.json"), &cfg_json) ||
+      !read_file_bytes(join_path(hop->dir, "vocab.json"), &vocab_json) ||
+      !read_file_bytes(join_path(hop->dir, "source.spm"), &spm_bytes)) {
+    return fail();
+  }
+  parse_json_int_field(cfg_json, "decoder_start_token_id", &hop->decoder_start_token_id);
+  parse_json_int_field(cfg_json, "eos_token_id", &hop->eos_token_id);
+  parse_json_int_field(cfg_json, "pad_token_id", &hop->pad_token_id);
+  parse_json_int_field(cfg_json, "decoder_layers", &hop->decoder_layers);
+  parse_json_int_field(cfg_json, "decoder_attention_heads", &hop->decoder_heads);
+  parse_json_int_field(cfg_json, "d_model", &hop->d_model);
+  if (hop->decoder_layers < 1 || hop->decoder_heads < 1 || hop->d_model < hop->decoder_heads) return fail();
+  if (!parse_marian_vocab(vocab_json, hop) || !parse_sentencepiece_spm(spm_bytes, hop)) return fail();
+  hop->encoder = create_ort_session(state->ort, join_path(hop->dir, "encoder_model.onnx"));
+  if (hop->encoder == nullptr) return fail();
+  hop->decoder = create_ort_session(state->ort, join_path(hop->dir, "decoder_model.onnx"));
+  if (hop->decoder == nullptr) return fail();
+  hop->has_merged_cache = detect_merged_cache(state->ort, hop->decoder);
+  hop->mode = TransMode::kLive;
+  return 0;
+}
+
+bool is_ngram_blocked(const std::vector<int32_t>& generated, int32_t candidate) {
+  if (generated.size() < 3) return false;
+  const int32_t a = generated[generated.size() - 2];
+  const int32_t b = generated[generated.size() - 1];
+  for (size_t i = 0; i + 2 < generated.size(); ++i) {
+    if (generated[i] == a && generated[i + 1] == b && generated[i + 2] == candidate) return true;
+  }
+  return false;
+}
+
+int32_t pick_best_logit(const float* logits_row, size_t vocab_size, const MarianHop& hop,
+                        const std::vector<int32_t>& generated) {
+  int32_t best_tok = hop.eos_token_id;
+  float best_val = -std::numeric_limits<float>::infinity();
+  for (size_t v = 0; v < vocab_size; ++v) {
+    const int32_t tid = static_cast<int32_t>(v);
+    if (tid == hop.pad_token_id) continue;
+    if (is_ngram_blocked(generated, tid)) continue;
+    if (logits_row[v] > best_val) {
+      best_val = logits_row[v];
+      best_tok = tid;
+    }
+  }
+  return best_tok;
+}
+
+bool check_status(const OrtApi* api, OrtStatus* st) {
+  if (st == nullptr) return true;
+  api->ReleaseStatus(st);
+  return false;
+}
+
+int run_marian_sentence(const OrtRuntime& ort, const MarianHop& hop, const std::string& sentence, std::string* out) {
+  const OrtApi* api = ort.api;
+  std::vector<int64_t> src_ids = encode_marian_text(hop, sentence);
+  const int64_t seq_len = static_cast<int64_t>(src_ids.size());
+  std::vector<int64_t> attn_mask(static_cast<size_t>(seq_len), 1);
+  const int64_t enc_shape[2] = {1, seq_len};
+
+  OrtValue* input_ids_val = nullptr;
+  OrtValue* attn_mask_val = nullptr;
+  OrtValue* hidden_val = nullptr;
+  auto cleanup_enc = [&]() {
+    if (hidden_val) api->ReleaseValue(hidden_val);
+    if (attn_mask_val) api->ReleaseValue(attn_mask_val);
+    if (input_ids_val) api->ReleaseValue(input_ids_val);
+  };
+
+  OrtStatus* st = api->CreateTensorWithDataAsOrtValue(
+      ort.mem_info, src_ids.data(), src_ids.size() * sizeof(int64_t), enc_shape, 2,
+      ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, &input_ids_val);
+  if (st != nullptr || input_ids_val == nullptr) {
+    if (st) api->ReleaseStatus(st);
+    cleanup_enc();
+    return -5;
+  }
+  st = api->CreateTensorWithDataAsOrtValue(
+      ort.mem_info, attn_mask.data(), attn_mask.size() * sizeof(int64_t), enc_shape, 2,
+      ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, &attn_mask_val);
+  if (st != nullptr || attn_mask_val == nullptr) {
+    if (st) api->ReleaseStatus(st);
+    cleanup_enc();
+    return -5;
+  }
+
+  const char* enc_in_names[2] = {"input_ids", "attention_mask"};
+  const OrtValue* enc_in_vals[2] = {input_ids_val, attn_mask_val};
+  const char* enc_out_names[1] = {"last_hidden_state"};
+  st = api->Run(hop.encoder, nullptr, enc_in_names, enc_in_vals, 2, enc_out_names, 1, &hidden_val);
+  if (st != nullptr || hidden_val == nullptr) {
+    if (st) api->ReleaseStatus(st);
+    cleanup_enc();
+    return -5;
+  }
+
+  std::vector<int32_t> dec_ids = {hop.decoder_start_token_id};
+  int max_steps = static_cast<int>(seq_len * 4 + 16);
+  if (max_steps < 32) max_steps = 32;
+  if (max_steps > 256) max_steps = 256;
+
+  if (hop.has_merged_cache) {
+    const int L = hop.decoder_layers;
+    const int64_t heads = hop.decoder_heads;
+    const int64_t head_dim = hop.d_model / hop.decoder_heads;
+    std::vector<OrtValue*> dec_past(static_cast<size_t>(L * 2), nullptr);
+    std::vector<OrtValue*> enc_past(static_cast<size_t>(L * 2), nullptr);
+    auto cleanup_past = [&]() {
+      for (OrtValue* v : dec_past) {
+        if (v) api->ReleaseValue(v);
+      }
+      for (OrtValue* v : enc_past) {
+        if (v) api->ReleaseValue(v);
+      }
+    };
+
+    float dummy_float = 0.0f;
+    const int64_t empty_kv_shape[4] = {1, heads, 0, head_dim};
+    for (int i = 0; i < L * 2; ++i) {
+      st = api->CreateTensorWithDataAsOrtValue(ort.mem_info, &dummy_float, 0, empty_kv_shape, 4,
+                                               ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &dec_past[static_cast<size_t>(i)]);
+      if (st) api->ReleaseStatus(st);
+      st = api->CreateTensorWithDataAsOrtValue(ort.mem_info, &dummy_float, 0, empty_kv_shape, 4,
+                                               ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &enc_past[static_cast<size_t>(i)]);
+      if (st) api->ReleaseStatus(st);
+    }
+
+    std::vector<std::string> in_name_strs;
+    in_name_strs.reserve(static_cast<size_t>(4 + L * 4));
+    in_name_strs.push_back("encoder_attention_mask");
+    in_name_strs.push_back("input_ids");
+    in_name_strs.push_back("encoder_hidden_states");
+    for (int l = 0; l < L; ++l) {
+      const std::string p = "past_key_values." + std::to_string(l);
+      in_name_strs.push_back(p + ".decoder.key");
+      in_name_strs.push_back(p + ".decoder.value");
+      in_name_strs.push_back(p + ".encoder.key");
+      in_name_strs.push_back(p + ".encoder.value");
+    }
+    in_name_strs.push_back("use_cache_branch");
+    std::vector<const char*> in_names;
+    for (const std::string& s : in_name_strs) in_names.push_back(s.c_str());
+
+    for (int step = 0; step < max_steps; ++step) {
+      int64_t cur_tok = static_cast<int64_t>(dec_ids.back());
+      const int64_t tok_shape[2] = {1, 1};
+      bool use_cache = step > 0;
+      const int64_t bool_shape[1] = {1};
+      OrtValue* tok_val = nullptr;
+      OrtValue* cache_val = nullptr;
+      st = api->CreateTensorWithDataAsOrtValue(ort.mem_info, &cur_tok, sizeof(int64_t), tok_shape, 2,
+                                               ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, &tok_val);
+      if (st) api->ReleaseStatus(st);
+      st = api->CreateTensorWithDataAsOrtValue(ort.mem_info, &use_cache, sizeof(bool), bool_shape, 1,
+                                               ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL, &cache_val);
+      if (st) api->ReleaseStatus(st);
+
+      std::vector<const OrtValue*> in_vals;
+      in_vals.reserve(in_names.size());
+      in_vals.push_back(attn_mask_val);
+      in_vals.push_back(tok_val);
+      in_vals.push_back(hidden_val);
+      for (int l = 0; l < L; ++l) {
+        in_vals.push_back(dec_past[static_cast<size_t>(l * 2)]);
+        in_vals.push_back(dec_past[static_cast<size_t>(l * 2 + 1)]);
+        in_vals.push_back(enc_past[static_cast<size_t>(l * 2)]);
+        in_vals.push_back(enc_past[static_cast<size_t>(l * 2 + 1)]);
+      }
+      in_vals.push_back(cache_val);
+
+      std::vector<std::string> out_name_strs;
+      out_name_strs.push_back("logits");
+      for (int l = 0; l < L; ++l) {
+        const std::string p = "present." + std::to_string(l);
+        out_name_strs.push_back(p + ".decoder.key");
+        out_name_strs.push_back(p + ".decoder.value");
+        if (step == 0) {
+          out_name_strs.push_back(p + ".encoder.key");
+          out_name_strs.push_back(p + ".encoder.value");
+        }
+      }
+      std::vector<const char*> out_names;
+      for (const std::string& s : out_name_strs) out_names.push_back(s.c_str());
+      std::vector<OrtValue*> out_vals(out_names.size(), nullptr);
+
+      st = api->Run(hop.decoder, nullptr, in_names.data(), in_vals.data(), in_vals.size(), out_names.data(),
+                    out_names.size(), out_vals.data());
+      if (tok_val) api->ReleaseValue(tok_val);
+      if (cache_val) api->ReleaseValue(cache_val);
+      if (st != nullptr || out_vals[0] == nullptr) {
+        if (st) api->ReleaseStatus(st);
+        for (OrtValue* v : out_vals) {
+          if (v) api->ReleaseValue(v);
+        }
+        cleanup_past();
+        cleanup_enc();
+        return -5;
+      }
+
+      OrtTensorTypeAndShapeInfo* shape_info = nullptr;
+      size_t dim_count = 0;
+      if (!check_status(api, api->GetTensorTypeAndShape(out_vals[0], &shape_info)) || shape_info == nullptr) {
+        for (OrtValue* v : out_vals) {
+          if (v) api->ReleaseValue(v);
+        }
+        cleanup_past();
+        cleanup_enc();
+        return -5;
+      }
+      (void)check_status(api, api->GetDimensionsCount(shape_info, &dim_count));
+      std::vector<int64_t> dims(dim_count, 0);
+      if (dim_count > 0) (void)check_status(api, api->GetDimensions(shape_info, dims.data(), dim_count));
+      api->ReleaseTensorTypeAndShapeInfo(shape_info);
+      const size_t vocab_size = (dim_count >= 3 && dims[2] > 0) ? static_cast<size_t>(dims[2]) : hop.id_to_piece.size();
+      float* logits_ptr = nullptr;
+      if (!check_status(api, api->GetTensorMutableData(out_vals[0], reinterpret_cast<void**>(&logits_ptr))) ||
+          logits_ptr == nullptr) {
+        for (OrtValue* v : out_vals) {
+          if (v) api->ReleaseValue(v);
+        }
+        cleanup_past();
+        cleanup_enc();
+        return -5;
+      }
+      const int32_t next_tok = pick_best_logit(logits_ptr, vocab_size, hop, dec_ids);
+      api->ReleaseValue(out_vals[0]);
+
+      size_t cursor = 1;
+      for (int l = 0; l < L; ++l) {
+        if (dec_past[static_cast<size_t>(l * 2)]) api->ReleaseValue(dec_past[static_cast<size_t>(l * 2)]);
+        if (dec_past[static_cast<size_t>(l * 2 + 1)]) api->ReleaseValue(dec_past[static_cast<size_t>(l * 2 + 1)]);
+        dec_past[static_cast<size_t>(l * 2)] = out_vals[cursor++];
+        dec_past[static_cast<size_t>(l * 2 + 1)] = out_vals[cursor++];
+        if (step == 0) {
+          if (enc_past[static_cast<size_t>(l * 2)]) api->ReleaseValue(enc_past[static_cast<size_t>(l * 2)]);
+          if (enc_past[static_cast<size_t>(l * 2 + 1)]) api->ReleaseValue(enc_past[static_cast<size_t>(l * 2 + 1)]);
+          enc_past[static_cast<size_t>(l * 2)] = out_vals[cursor++];
+          enc_past[static_cast<size_t>(l * 2 + 1)] = out_vals[cursor++];
+        }
+      }
+
+      if (next_tok == hop.eos_token_id) break;
+      dec_ids.push_back(next_tok);
+    }
+    cleanup_past();
+  } else {
+    const char* dec_in_names[3] = {"encoder_attention_mask", "input_ids", "encoder_hidden_states"};
+    const char* dec_out_names[1] = {"logits"};
+    for (int step = 0; step < max_steps; ++step) {
+      std::vector<int64_t> cur_ids(dec_ids.begin(), dec_ids.end());
+      const int64_t dec_shape[2] = {1, static_cast<int64_t>(cur_ids.size())};
+      OrtValue* dec_in_val = nullptr;
+      st = api->CreateTensorWithDataAsOrtValue(ort.mem_info, cur_ids.data(), cur_ids.size() * sizeof(int64_t),
+                                               dec_shape, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, &dec_in_val);
+      if (st != nullptr || dec_in_val == nullptr) {
+        if (st) api->ReleaseStatus(st);
+        cleanup_enc();
+        return -5;
+      }
+      const OrtValue* dec_in_vals[3] = {attn_mask_val, dec_in_val, hidden_val};
+      OrtValue* logits_val = nullptr;
+      st = api->Run(hop.decoder, nullptr, dec_in_names, dec_in_vals, 3, dec_out_names, 1, &logits_val);
+      api->ReleaseValue(dec_in_val);
+      if (st != nullptr || logits_val == nullptr) {
+        if (st) api->ReleaseStatus(st);
+        if (logits_val) api->ReleaseValue(logits_val);
+        cleanup_enc();
+        return -5;
+      }
+      OrtTensorTypeAndShapeInfo* shape_info = nullptr;
+      size_t dim_count = 0;
+      if (!check_status(api, api->GetTensorTypeAndShape(logits_val, &shape_info)) || shape_info == nullptr) {
+        api->ReleaseValue(logits_val);
+        cleanup_enc();
+        return -5;
+      }
+      (void)check_status(api, api->GetDimensionsCount(shape_info, &dim_count));
+      std::vector<int64_t> dims(dim_count, 0);
+      if (dim_count > 0) (void)check_status(api, api->GetDimensions(shape_info, dims.data(), dim_count));
+      api->ReleaseTensorTypeAndShapeInfo(shape_info);
+      const size_t vocab_size = (dim_count >= 3 && dims[2] > 0) ? static_cast<size_t>(dims[2]) : hop.id_to_piece.size();
+      float* logits_ptr = nullptr;
+      if (!check_status(api, api->GetTensorMutableData(logits_val, reinterpret_cast<void**>(&logits_ptr))) ||
+          logits_ptr == nullptr) {
+        api->ReleaseValue(logits_val);
+        cleanup_enc();
+        return -5;
+      }
+      const size_t row_offset = (cur_ids.size() - 1) * vocab_size;
+      const int32_t next_tok = pick_best_logit(logits_ptr + row_offset, vocab_size, hop, dec_ids);
+      api->ReleaseValue(logits_val);
+      if (next_tok == hop.eos_token_id) break;
+      dec_ids.push_back(next_tok);
+    }
+  }
+
+  cleanup_enc();
+  *out = decode_marian_tokens(hop, dec_ids);
+  return 0;
+}
+
+std::vector<std::string> split_translation_chunks(const std::string& text) {
+  std::vector<std::string> parts;
+  std::string cur;
+  size_t chars = 0;
+  for (size_t i = 0; i < text.size();) {
+    unsigned char c = static_cast<unsigned char>(text[i]);
+    size_t len = (c & 0x80) == 0 ? 1 : ((c & 0xE0) == 0xC0 ? 2 : ((c & 0xF0) == 0xE0 ? 3 : 4));
+    if (i + len > text.size()) len = 1;
+    const std::string ch = text.substr(i, len);
+    i += len;
+    if (ch == "\n") {
+      if (!cur.empty()) {
+        parts.push_back(cur);
+        cur.clear();
+        chars = 0;
+      }
+      continue;
+    }
+    cur += ch;
+    ++chars;
+    const bool sent_end = (ch == "." || ch == "!" || ch == "?" || ch == "。" || ch == "！" || ch == "？");
+    if ((sent_end && chars >= 120) || chars >= 320) {
+      parts.push_back(cur);
+      cur.clear();
+      chars = 0;
+    }
+  }
+  if (!cur.empty()) parts.push_back(cur);
+  return parts;
+}
+
+int run_marian_hop(EngineState* state, MarianHop* hop, const std::string& text, std::string* out) {
+  const int rc = ensure_marian_hop(state, hop);
+  if (rc != 0) return rc;
+  const std::vector<std::string> chunks = split_translation_chunks(text);
+  out->clear();
+  for (const std::string& chunk : chunks) {
+    bool blank = true;
+    for (char c : chunk) {
+      if (c != ' ' && c != '\t' && c != '\r' && c != '\n') {
+        blank = false;
+        break;
+      }
+    }
+    if (blank) continue;
+    std::string piece;
+    const int step_rc = run_marian_sentence(state->ort, *hop, chunk, &piece);
+    if (step_rc != 0) return step_rc;
+    if (!piece.empty()) {
+      if (!out->empty()) out->push_back(' ');
+      out->append(piece);
+    }
+  }
+  return 0;
+}
+
+int trans_translate(void* user, const char* text, char* out, int32_t out_cap) {
+  EngineState* state = static_cast<EngineState*>(user);
+  if (state == nullptr || text == nullptr || out == nullptr || out_cap < 1) return -1;
+  out[0] = '\0';
+  const std::string input(text);
+  bool blank = true;
+  for (char c : input) {
+    if (c != ' ' && c != '\t' && c != '\r' && c != '\n') {
+      blank = false;
+      break;
+    }
+  }
+  if (blank) return 0;
+  std::string mid;
+  const int rc1 = run_marian_hop(state, &state->hop1, input, &mid);
+  if (rc1 != 0) return rc1;
+  std::string final_out = mid;
+  if (!state->hop2.dir.empty()) {
+    const int rc2 = run_marian_hop(state, &state->hop2, mid, &final_out);
+    if (rc2 != 0) return rc2;
+  }
+  if (static_cast<int32_t>(final_out.size()) >= out_cap) return -1;
+  std::memcpy(out, final_out.c_str(), final_out.size() + 1);
+  return 0;
+}
+
 }  // namespace
 
 extern "C" void* apexo_engine_state_create(const char* asr_model_dir, const char* gemma_path) {
@@ -809,16 +1695,53 @@ extern "C" void apexo_engine_state_set_libraries(void* user, const char* sherpa_
   if (state->asr_mode != AsrMode::kLive) state->asr_mode = AsrMode::kUnknown;
 }
 
+extern "C" void apexo_engine_state_set_ort_library(void* user, const char* ort_library) {
+  EngineState* state = static_cast<EngineState*>(user);
+  if (state == nullptr) return;
+  state->ort_library = ort_library != nullptr ? ort_library : "";
+  if (state->hop1.mode != TransMode::kLive) state->hop1.mode = TransMode::kUnknown;
+  if (state->hop2.mode != TransMode::kLive) state->hop2.mode = TransMode::kUnknown;
+}
+
+extern "C" void apexo_engine_state_set_asr_model_dir(void* user, const char* asr_model_dir) {
+  EngineState* state = static_cast<EngineState*>(user);
+  if (state == nullptr) return;
+  destroy_recognizer_state(state);
+  state->asr_dir = asr_model_dir != nullptr ? asr_model_dir : "";
+  state->tokens_path = join_path(state->asr_dir, "tokens.txt");
+  state->encoder_path = join_path(state->asr_dir, "encoder.onnx");
+  state->decoder_path = join_path(state->asr_dir, "decoder.onnx");
+  state->joiner_path = join_path(state->asr_dir, "joiner.onnx");
+}
+
+extern "C" void apexo_engine_state_set_translation_model_dirs(void* user, const char* model_dir,
+                                                              const char* pivot_model_dir) {
+  EngineState* state = static_cast<EngineState*>(user);
+  if (state == nullptr) return;
+  unload_marian_hop(state->ort, &state->hop1);
+  unload_marian_hop(state->ort, &state->hop2);
+  state->hop1.dir = model_dir != nullptr ? model_dir : "";
+  state->hop2.dir = pivot_model_dir != nullptr ? pivot_model_dir : "";
+}
+
 extern "C" void apexo_engine_state_destroy(void* user) {
   EngineState* state = static_cast<EngineState*>(user);
   if (state == nullptr) return;
   unload_gemma(state);
-  if (state->stream != nullptr && state->sherpa.destroy_stream != nullptr) state->sherpa.destroy_stream(state->stream);
-  if (state->recognizer != nullptr && state->sherpa.destroy_recognizer != nullptr) {
-    state->sherpa.destroy_recognizer(state->recognizer);
+  unload_marian_hop(state->ort, &state->hop1);
+  unload_marian_hop(state->ort, &state->hop2);
+  if (state->ort.mem_info != nullptr && state->ort.api != nullptr) {
+    state->ort.api->ReleaseMemoryInfo(state->ort.mem_info);
+    state->ort.mem_info = nullptr;
   }
+  if (state->ort.env != nullptr && state->ort.api != nullptr) {
+    state->ort.api->ReleaseEnv(state->ort.env);
+    state->ort.env = nullptr;
+  }
+  destroy_recognizer_state(state);
   close_library(state->sherpa.library);
   close_library(state->litert.library);
+  close_library(state->ort.library);
   delete state;
 }
 
@@ -834,5 +1757,7 @@ extern "C" int apexo_engine_state_bind(void* user, ApexoEngines* out) {
   out->sum_unload = sum_unload;
   out->sum_generate = sum_generate;
   out->asr_finish = asr_finish;
+  out->trans_user = user;
+  out->trans_translate = trans_translate;
   return 0;
 }

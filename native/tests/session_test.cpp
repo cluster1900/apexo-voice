@@ -774,6 +774,160 @@ void test_v020_contracts() {
   }
 }
 
+void test_translation_and_multilingual_summary() {
+  struct TransState {
+    int calls = 0;
+    int rc = 0;
+    std::string prefix = "EN:";
+  };
+  auto fake_translate = [](void* user, const char* text, char* out, int32_t cap) -> int {
+    TransState* st = static_cast<TransState*>(user);
+    st->calls += 1;
+    if (st->rc != 0) return st->rc;
+    const std::string res = st->prefix + (text ? text : "");
+    if (static_cast<int32_t>(res.size()) >= cap) return -1;
+    std::memcpy(out, res.c_str(), res.size() + 1);
+    return 0;
+  };
+
+  // 1. Live A -> B recording: push_pcm -> real-time translation -> translated_display_text / full_translation -> summarize in B.
+  {
+    Scripted script;
+    script.events.push_back(interim_event("大家", 0, 200));
+    script.events.push_back(final_event("大家好", 0, 600));
+    script.events.push_back(final_event("今天开会", 900, 1400));  // gap < 2000ms -> merges on both display and translated display
+    script.events.push_back(final_event("下周三发布", 4000, 4800));
+    TransState trans;
+    ApexoConfig config;
+    std::memset(&config, 0, sizeof(config));
+    config.merge_gap_ms = APEXO_MERGE_GAP_MS;
+    config.summary_chunk_chars = APEXO_SUMMARY_CHUNK_CHARS;
+    config.display_lines = APEXO_DISPLAY_LINES;
+    config.summary_model_path = "gemma-4-E2B-it.litertlm";
+    config.source_lang = "zh-CN";
+    config.target_lang = "en-US";
+    ApexoEngines engines;
+    std::memset(&engines, 0, sizeof(engines));
+    script.index = 0;
+    script.reset_count = 0;
+    script.finish_count = 0;
+    script.finish_rc = 0;
+    script.has_finish_event = 1;
+    script.finish_event = final_event("收尾确认", 7500, 8100);
+    script.load_count = 0;
+    script.load_rc = 0;
+    script.generate_rc = 0;
+    script.loaded = 0;
+    script.resident_during_generate = -1;
+    script.release_during_generate = 0;
+    script.reset_during_generate = 0;
+    script.destroy_during_generate = 0;
+    script.push_during_load = 0;
+    script.push_during_generate = 0;
+    script.push_during_unload = 0;
+    script.busy_rc_during_generate = -999;
+    script.shrink_synthesis = 0;
+    script.reply = "Summary: Release moved to next Wednesday.";
+    engines.asr_user = &script;
+    engines.asr_push = asr_push;
+    engines.asr_reset = asr_reset;
+    engines.asr_finish = asr_finish;
+    engines.sum_user = &script;
+    engines.sum_is_loaded = sum_is_loaded;
+    engines.sum_load = sum_load;
+    engines.sum_unload = sum_unload;
+    engines.sum_generate = sum_generate;
+    engines.trans_user = &trans;
+    engines.trans_translate = fake_translate;
+
+    ApexoSession* session = apexo_session_create(&config, &engines);
+    script.session = session;
+    expect(std::strcmp(apexo_session_source_lang(session), "zh") == 0 &&
+               std::strcmp(apexo_session_target_lang(session), "en") == 0,
+           "lang-norm: BCP-47 zh-CN / en-US normalize to zh / en");
+
+    CallbackCollector trans_col{session, {}, {}};
+    apexo_session_set_translation_callback(session, on_transcript_cb, &trans_col);
+
+    push(session);  // interim only -> no translation call yet
+    expect(trans.calls == 0 && trans_col.events.empty(),
+           "trans-live: interim speech does not invoke offline translator");
+
+    push(session);  // final 1
+    push(session);  // final 2 (merges with final 1)
+    expect(trans.calls == 2 &&
+               std::strcmp(apexo_session_display_text(session), "大家好今天开会") == 0 &&
+               std::strcmp(apexo_session_translated_display_text(session), "EN:大家好EN:今天开会") == 0 &&
+               std::strcmp(apexo_session_full_translation(session), "EN:大家好\nEN:今天开会") == 0,
+           "trans-live: finalized utterances translate immediately and merge cleanly on translated display");
+
+    // Stage summary in target language B ("en") while recording continues:
+    char stage_out[512];
+    expect(apexo_session_summarize_new(session, stage_out, sizeof(stage_out)) == 0 &&
+               std::strcmp(stage_out, "Release moved to next Wednesday.") == 0,
+           "trans-summary-new: summarizes in target language B and strips English 'Summary:' label");
+    expect(!script.prompts.empty() &&
+               script.prompts.back().find("Write strictly in English") != std::string::npos &&
+               script.prompts.back().find("EN:大家好\nEN:今天开会") != std::string::npos,
+           "trans-summary-new: feeds translated B text and English instruction to Gemma");
+
+    push(session);  // final 3
+    apexo_session_end_segment(session);  // flushes finish_event ("收尾确认") and translates it
+    expect(trans.calls == 4 && trans_col.events.size() == 4 &&
+               std::string(apexo_session_full_translation(session)).find("EN:收尾确认") != std::string::npos,
+           "trans-end-segment: flushed tail utterance is translated and delivered via translation callback");
+
+    script.prompts.clear();
+    char full_out[512];
+    expect(apexo_session_summarize(session, full_out, sizeof(full_out)) == 0 &&
+               std::strcmp(full_out, "Release moved to next Wednesday.") == 0 &&
+               script.prompts.back().find("Material:\nEN:大家好\nEN:今天开会\nEN:下周三发布\nEN:收尾确认") != std::string::npos,
+           "trans-summarize: full summary uses complete B-language translation and target-language synthesis prompt");
+
+    // Direct translate_text does not mutate session transcript/translation state.
+    char direct_out[256];
+    expect(apexo_session_translate_text(session, "独立句子", direct_out, sizeof(direct_out)) == 0 &&
+               std::strcmp(direct_out, "EN:独立句子") == 0,
+           "translate_text: translates caller text without mutating session transcript");
+
+    // Japanese target language prompt & heading strip check:
+    apexo_session_set_languages(session, "en", "ja");
+    script.reply = "要約：来週水曜日にリリースします。";
+    script.prompts.clear();
+    char ja_sum[512];
+    expect(apexo_session_summarize_text(session, "Release next Wednesday.", ja_sum, sizeof(ja_sum)) == 0 &&
+               std::strcmp(ja_sum, "来週水曜日にリリースします。") == 0 &&
+               script.prompts.back().find("日本語") != std::string::npos,
+           "multilingual-summarize-text: Japanese target language uses Japanese prompt and strips '要約：'");
+
+    apexo_session_reset(session);
+    expect(std::strcmp(apexo_session_translated_display_text(session), "") == 0 &&
+               std::strcmp(apexo_session_full_translation(session), "") == 0,
+           "trans-reset: reset clears translated display and full translation");
+    apexo_session_destroy(session);
+  }
+
+  // 2. Same-language passthrough (en -> en) works without translator attached, and missing translator for A != B returns -3.
+  {
+    Scripted script;
+    script.events.push_back(final_event("hello world", 0, 500));
+    ApexoSession* session = open_session(&script, "gemma-4-E2B-it.litertlm", 0);
+    apexo_session_set_languages(session, "en", "en");
+    char out[128];
+    expect(apexo_session_translate_text(session, "same language", out, sizeof(out)) == 0 &&
+               std::strcmp(out, "same language") == 0,
+           "same-lang: translate_text passes through without translator engine when source == target");
+    push(session);
+    expect(std::strcmp(apexo_session_full_translation(session), "hello world") == 0,
+           "same-lang: live utterance populates full_translation directly when source == target");
+
+    apexo_session_set_languages(session, "en", "fr");
+    expect(apexo_session_translate_text(session, "hello", out, sizeof(out)) == -3 && out[0] == '\0',
+           "missing-translator: translate_text returns -3 and writes empty output when translator is not attached");
+    apexo_session_destroy(session);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -783,6 +937,7 @@ int main() {
   test_summary();
   test_fixes();
   test_v020_contracts();
+  test_translation_and_multilingual_summary();
   if (failures != 0) {
     std::printf("%d failure(s)\n", failures);
     return 1;
